@@ -1,0 +1,14 @@
+.venv/
+demo/.venv/
+
+__pycache__/
+*.py[cod]
+*.so
+
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+.DS_Store
+
+demo/results/

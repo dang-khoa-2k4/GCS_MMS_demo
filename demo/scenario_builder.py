@@ -1,0 +1,105 @@
+"""
+scenario_builder.py - Build a runnable planning scenario from config + preset.
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+from typing import List
+
+import numpy as np
+
+from app_config import DemoConfig, ResolvedScenario
+from convex_regions import ConvexRegion, create_buffered_regions_from_vertices_list
+from dynamics import UnicycleModel
+from environment import Environment, create_environment_from_vertices
+from graph_builder import RegionGraph, build_region_graph
+from optimizer import IntegratedMIOCPSolver, create_integrated_optimizer_from_config
+from problem_data import PROBLEM_PRESETS, ProblemPresetSpec
+
+
+@dataclass
+class PreparedScenario:
+    """Fully built runtime objects for a scenario."""
+    resolved: ResolvedScenario
+    preset: ProblemPresetSpec
+    environment: Environment
+    regions: List[ConvexRegion]
+    graph: RegionGraph
+    dynamics: UnicycleModel
+    optimizer: IntegratedMIOCPSolver
+    workspace_bounds: tuple[float, float, float, float]
+
+
+def list_problem_presets() -> List[str]:
+    """Available geometry presets."""
+    return list(PROBLEM_PRESETS.keys())
+
+
+def get_problem_preset(name: str) -> ProblemPresetSpec:
+    """Look up a geometry preset by key."""
+    try:
+        return PROBLEM_PRESETS[name]
+    except KeyError as exc:
+        available = ", ".join(list_problem_presets())
+        raise ValueError(f"Unknown problem preset '{name}'. Available: {available}") from exc
+
+
+def build_environment_and_regions(preset: ProblemPresetSpec) -> tuple[Environment, List[ConvexRegion]]:
+    """Construct environment and buffered convex regions from a preset."""
+    environment = create_environment_from_vertices(
+        preset.workspace_vertices,
+        preset.obstacle_vertices
+    )
+    regions = create_buffered_regions_from_vertices_list(
+        [np.asarray(vertices, dtype=np.float64) for vertices in preset.region_vertices],
+        np.asarray(preset.workspace_vertices, dtype=np.float64),
+        preset.region_buffer
+    )
+    return environment, regions
+
+
+def _select_region_subset(regions: List[ConvexRegion],
+                          active_region_indices: List[int] | None) -> List[ConvexRegion]:
+    """Copy and reindex a region subset for a specific scenario."""
+    if active_region_indices is None:
+        selected = copy.deepcopy(regions)
+    else:
+        selected = [copy.deepcopy(regions[idx]) for idx in active_region_indices]
+
+    for index, region in enumerate(selected):
+        region.index = index
+        region.label = f"R{index}"
+
+    return selected
+
+
+def prepare_scenario(config: DemoConfig, scenario_name: str) -> PreparedScenario:
+    """Build all runtime objects needed to solve one scenario."""
+    resolved = config.resolve_scenario(scenario_name)
+    preset = get_problem_preset(resolved.problem_preset)
+    environment, all_regions = build_environment_and_regions(preset)
+    regions = _select_region_subset(all_regions, resolved.active_region_indices)
+
+    dyn_cfg = resolved.runtime_config.get("dynamics", {})
+    dynamics = UnicycleModel(
+        v_min=dyn_cfg.get("v_min", -2.0),
+        v_max=dyn_cfg.get("v_max", 2.0),
+        omega_min=dyn_cfg.get("omega_min", -np.pi),
+        omega_max=dyn_cfg.get("omega_max", np.pi),
+    )
+
+    graph = build_region_graph(regions, resolved.start_state[:2], resolved.goal_state[:2])
+    optimizer = create_integrated_optimizer_from_config(graph, dynamics, resolved.runtime_config)
+
+    return PreparedScenario(
+        resolved=resolved,
+        preset=preset,
+        environment=environment,
+        regions=regions,
+        graph=graph,
+        dynamics=dynamics,
+        optimizer=optimizer,
+        workspace_bounds=environment.get_bounds(),
+    )
