@@ -5,19 +5,31 @@ scenario_builder.py - Build a runnable planning scenario from config + preset.
 from __future__ import annotations
 
 import copy
+import os
+import sys
 from dataclasses import dataclass
 from typing import List
 
 import numpy as np
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 from app_config import DemoConfig, ResolvedScenario
-from convex_regions import ConvexRegion, create_buffered_regions_from_vertices_list
+from convex_regions import ConvexRegion, create_buffered_regions_from_vertices_list, create_regions_from_vertices_list
 from dynamics import UnicycleModel
 from environment import Environment, create_environment_from_vertices
 from graph_builder import RegionGraph, build_region_graph
 from optimizer import IntegratedMIOCPSolver, create_integrated_optimizer_from_config
 from problem_data import PROBLEM_PRESETS, ProblemPresetSpec
 
+# Decompose
+from acd2d.acd2d import ACD2D
+
+# Setup
+acd = ACD2D()
+acd.set_parameters(tau=0.0)
 
 @dataclass
 class PreparedScenario:
@@ -47,16 +59,40 @@ def get_problem_preset(name: str) -> ProblemPresetSpec:
 
 
 def build_environment_and_regions(preset: ProblemPresetSpec) -> tuple[Environment, List[ConvexRegion]]:
-    """Construct environment and buffered convex regions from a preset."""
+    """Construct environment and convex regions from a preset."""
     environment = create_environment_from_vertices(
         preset.workspace_vertices,
         preset.obstacle_vertices
     )
-    regions = create_buffered_regions_from_vertices_list(
-        [np.asarray(vertices, dtype=np.float64) for vertices in preset.region_vertices],
-        np.asarray(preset.workspace_vertices, dtype=np.float64),
-        preset.region_buffer
-    )
+
+    decomposition_error = None
+    try:
+        # Decompose workspace into convex polygons and build native ConvexRegion
+        # objects directly from the polygon vertex lists.
+        region_vertices, _result = acd.decompose_to_polygons(
+            environment.workspace,
+            holes=environment.obstacles
+        )
+    except Exception as exc:
+        print(f"Warning: ACD decomposition failed with error: {exc}")
+        decomposition_error = exc
+        region_vertices = []
+
+    if not region_vertices:
+        if not preset.region_vertices:
+            raise RuntimeError(
+                "ACD decomposition did not produce usable polygons and the preset "
+                "does not define fallback region vertices."
+            ) from decomposition_error
+        region_vertices = [
+            np.asarray(vertices, dtype=np.float64)
+            for vertices in preset.region_vertices
+        ]
+
+    print(f"Built environment with {len(environment.obstacles)} obstacles and {len(region_vertices)} regions")
+
+    regions = create_buffered_regions_from_vertices_list(region_vertices, preset.workspace_vertices,buffer_size=0.001)
+    # regions = create_regions_from_vertices_list(region_vertices)
     return environment, regions
 
 

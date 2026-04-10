@@ -9,7 +9,11 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+DEMO_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(DEMO_DIR)
+
+sys.path.insert(0, DEMO_DIR)
+sys.path.insert(0, REPO_ROOT)
 
 from app_config import DemoConfig
 

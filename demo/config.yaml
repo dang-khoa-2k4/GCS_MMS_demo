@@ -95,11 +95,11 @@ cost:
 # -----------------------------------------------------------------------------
 optimizer:
   # Safety limit for graph-path counting in experiment summaries
-  max_paths: 1000
+  max_paths: 1500
   
   # Solver verbosity/options for the integrated continuous relaxation solve
   ipopt:
-    max_iter: 3000
+    max_iter: 3500
     tol: 1.0e-6
     print_level: 0  # 0=silent, 5=verbose
     
@@ -146,29 +146,24 @@ scenarios:
   #   overrides.cost.a
   #   overrides.optimizer.ipopt.max_iter
   # You can also override `problem_preset`, `start_state`, and `goal_state`.
-  simple:
-    name: "Simple Environment"
-    description: "Subset of regions forming corridor to goal"
-    active_regions: [0, 1, 2, 6, 9, 10, 11]
+    
+  default:
+    name: "Default Environment"
+    description: "Default map with hand-crafted convex safe regions"
+    active_regions: "all"
+    problem_preset: "default"
     overrides:
       shooting:
         n_mesh_points: 5
     
-  medium:
-    name: "Medium Environment"  
-    description: "All regions active, moderate complexity"
+  maze:
+    name: "Maze Environment"
+    description: "Maze map with all active regions"
     active_regions: "all"
+    problem_preset: "maze"
     overrides:
       shooting:
-        n_mesh_points: 10
-    
-  high_resolution:
-    name: "High Resolution"
-    description: "All regions with increased mesh points"
-    active_regions: "all"
-    overrides:
-      shooting:
-        n_mesh_points: 15
+        n_mesh_points: 5
 
 # -----------------------------------------------------------------------------
 # Output Configuration

@@ -291,7 +291,8 @@ class ShootingBlockManager:
             'n_per_block': 2 * block.n_x + block.n_w + 2  # s-, s+, w, delta, rho
         }
     
-    def evaluate_path(self, path_regions: List[int], 
+    def evaluate_path(self,
+                      path_regions: List[int],
                       variables: Dict[int, Dict[str, np.ndarray]],
                       start_state: np.ndarray,
                       goal_state: np.ndarray,
@@ -300,14 +301,14 @@ class ShootingBlockManager:
         Evaluate a complete path through regions.
         
         Args:
-            path_regions: List of region indices in path order
-            variables: Dict mapping region index to {'s_minus', 's_plus', 'w', 'delta'}
-            start_state: Initial state
-            goal_state: Target state
-            cost_weights: Cost function weights
+            path_regions: List of region indices in path order.
+            variables: Region-indexed decision variable values.
+            start_state: Initial state.
+            goal_state: Target state.
+            cost_weights: Cost function weights.
             
         Returns:
-            Dict with trajectory data, costs, violations
+            Dict with trajectory data, costs, and feasibility checks.
         """
         result = {
             'trajectories': [],

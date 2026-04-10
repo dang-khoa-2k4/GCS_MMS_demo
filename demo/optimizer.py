@@ -37,9 +37,10 @@ class OptimizationConfig:
     
     # Shooting parameters
     n_integration_steps: int = 20
-    n_mesh_points: int = 10
+    n_mesh_points: int = 5
     n_control_segments: int = 2
     safety_margin: float = 0.02
+    boundary_tolerance: float = 1e-8
     
     # Time bounds
     delta_min: float = 0.1
@@ -60,6 +61,7 @@ class OptimizationConfig:
     max_iter: int = 3000
     tol: float = 1e-6
     print_level: int = 0
+    max_polish_path_candidates: int = 3
     
 @dataclass
 class OptimizationResult:
@@ -82,6 +84,7 @@ class OptimizationResult:
     
     # Trajectory data
     trajectories: List[Tuple[np.ndarray, np.ndarray, float]] = field(default_factory=list)
+    mesh_samples: List[Tuple[np.ndarray, np.ndarray, float]] = field(default_factory=list)
     
     # Diagnostics
     solver_status: str = ""
@@ -134,6 +137,34 @@ def _compute_bound_violation(g_val: np.ndarray,
     return float(max(np.max(low_viol), np.max(high_viol)))
 
 
+def _interior_mesh_indices(n_mesh: int) -> range:
+    """Return mesh indices that exclude the segment endpoints."""
+    if n_mesh <= 2:
+        return range(0)
+    return range(1, n_mesh - 1)
+
+
+def _get_graph_edge_anchor(graph: RegionGraph,
+                           edge: Tuple[str, str],
+                           start_state: np.ndarray,
+                           goal_state: np.ndarray) -> np.ndarray:
+    """Representative 2D anchor point for a graph edge."""
+    u, v = edge
+
+    if u == SOURCE:
+        return np.asarray(start_state[:2], dtype=np.float64)
+    if v == TARGET:
+        return np.asarray(goal_state[:2], dtype=np.float64)
+
+    intersection = graph.intersections.get(edge)
+    if intersection is not None:
+        return np.asarray(intersection.get_centroid(), dtype=np.float64)
+
+    u_centroid = graph.get_region_by_id(u).get_centroid()
+    v_centroid = graph.get_region_by_id(v).get_centroid()
+    return 0.5 * (u_centroid + v_centroid)
+
+
 class PathNLPSolver:
     """
     NLP solver for a fixed discrete path.
@@ -180,7 +211,9 @@ class PathNLPSolver:
         )
     
     def solve_path(self, path: List[str], start_state: np.ndarray,
-                   goal_state: np.ndarray) -> OptimizationResult:
+                   goal_state: np.ndarray,
+                   warm_start: Optional[Dict[int, Dict[str, np.ndarray | float]]] = None
+                   ) -> OptimizationResult:
         """
         Solve NLP for a fixed path.
         
@@ -213,7 +246,7 @@ class PathNLPSolver:
         
         try:
             result = self._build_and_solve_nlp(
-                path_regions, start_state, goal_state
+                path_regions, start_state, goal_state, warm_start=warm_start
             )
             result.path = path
             result.solve_time = time.time() - start_time
@@ -229,7 +262,9 @@ class PathNLPSolver:
     
     def _build_and_solve_nlp(self, path_regions: List[int],
                              start_state: np.ndarray,
-                             goal_state: np.ndarray) -> OptimizationResult:
+                             goal_state: np.ndarray,
+                             warm_start: Optional[Dict[int, Dict[str, np.ndarray | float]]] = None
+                             ) -> OptimizationResult:
         """Build and solve the NLP for a path."""
         n_regions = len(path_regions)
         n_x = self.dynamics.n_x
@@ -253,9 +288,43 @@ class PathNLPSolver:
         
         # Initial guess
         x0 = []
+
+        default_heading = np.arctan2(
+            goal_state[1] - start_state[1],
+            goal_state[0] - start_state[0]
+        )
         
         for i, region_idx in enumerate(path_regions):
             region = self.graph.regions[region_idx]
+            warm = warm_start.get(region_idx) if warm_start is not None else None
+            node_id = f"R{region_idx}"
+            incoming_edge = (
+                (SOURCE, node_id)
+                if i == 0 else
+                (f"R{path_regions[i - 1]}", node_id)
+            )
+            outgoing_edge = (
+                (node_id, TARGET)
+                if i == n_regions - 1 else
+                (node_id, f"R{path_regions[i + 1]}")
+            )
+            entry_pos = _get_graph_edge_anchor(
+                self.graph, incoming_edge, start_state, goal_state
+            )
+            exit_pos = _get_graph_edge_anchor(
+                self.graph, outgoing_edge, start_state, goal_state
+            )
+            direction = exit_pos - entry_pos
+            init_theta = default_heading
+            if np.linalg.norm(direction) > 1e-9:
+                init_theta = float(np.arctan2(direction[1], direction[0]))
+            delta_init = max(
+                self.config.delta_min,
+                min(
+                    self.config.delta_max,
+                    float(np.linalg.norm(direction)) / max(abs(self.config.v_max), 1e-6)
+                )
+            )
             
             # Entry state s_v^-
             s_minus = ca.MX.sym(f's_minus_{i}', n_x)
@@ -266,12 +335,13 @@ class PathNLPSolver:
             lbx.extend([0.0, 0.0, -2*np.pi])  # Relaxed position bounds
             ubx.extend([5.0, 5.0, 2*np.pi])
             
-            # Initial guess
-            alpha = i / max(n_regions - 1, 1)
-            init_pos = (1 - alpha) * start_state[:2] + alpha * goal_state[:2]
-            init_theta = np.arctan2(goal_state[1] - start_state[1],
-                                   goal_state[0] - start_state[0])
-            x0.extend([init_pos[0], init_pos[1], init_theta])
+            if warm is not None and 's_minus' in warm:
+                s_minus_init = np.asarray(warm['s_minus'], dtype=float).copy()
+                s_minus_init[:2] = entry_pos
+                s_minus_init[2] = init_theta
+                x0.extend(s_minus_init.tolist())
+            else:
+                x0.extend([entry_pos[0], entry_pos[1], init_theta])
             
             # Exit state s_v^+
             s_plus = ca.MX.sym(f's_plus_{i}', n_x)
@@ -280,9 +350,13 @@ class PathNLPSolver:
             lbx.extend([0.0, 0.0, -2*np.pi])
             ubx.extend([5.0, 5.0, 2*np.pi])
             
-            alpha = (i + 1) / max(n_regions, 1)
-            init_pos = (1 - alpha) * start_state[:2] + alpha * goal_state[:2]
-            x0.extend([init_pos[0], init_pos[1], init_theta])
+            if warm is not None and 's_plus' in warm:
+                s_plus_init = np.asarray(warm['s_plus'], dtype=float).copy()
+                s_plus_init[:2] = exit_pos
+                s_plus_init[2] = init_theta
+                x0.extend(s_plus_init.tolist())
+            else:
+                x0.extend([exit_pos[0], exit_pos[1], init_theta])
             
             # Control parameters w_v
             w = ca.MX.sym(f'w_{i}', n_w)
@@ -292,7 +366,10 @@ class PathNLPSolver:
             for seg in range(self.config.n_control_segments):
                 lbx.extend([self.config.v_min, self.config.omega_min])
                 ubx.extend([self.config.v_max, self.config.omega_max])
-                x0.extend([0.5, 0.0])  # Moderate forward velocity, no turning
+            if warm is not None and 'w' in warm:
+                x0.extend(np.asarray(warm['w'], dtype=float).tolist())
+            else:
+                x0.extend([0.5, 0.0] * self.config.n_control_segments)
             
             # Time duration Delta_v
             delta = ca.MX.sym(f'delta_{i}', 1)
@@ -300,7 +377,10 @@ class PathNLPSolver:
             
             lbx.append(self.config.delta_min)
             ubx.append(self.config.delta_max)
-            x0.append(1.0)  # Initial guess: 1 second per region
+            if warm is not None and 'delta' in warm:
+                x0.append(max(self.config.delta_min, min(self.config.delta_max, float(warm['delta']))))
+            else:
+                x0.append(delta_init)
         
         # Stack all variables
         x_vars = []
@@ -336,34 +416,36 @@ class PathNLPSolver:
             ubg.extend([0.0] * n_x)
         
         # -----------------------------------------------------------------
-        # Layer 2: Convex on/off geometry (safety constraints)
-        # Using Big-M style: A @ pos <= b - epsilon when active
-        # Since path is fixed, all regions in path are active (p_v = 1)
+        # Layer 2: Region geometry constraints.
+        # Interior mesh points must stay strictly inside the region, while
+        # entry/exit states are only required to remain in the closed set so
+        # transitions across shared boundaries stay feasible.
         # -----------------------------------------------------------------
         
         for i, region_idx in enumerate(path_regions):
             region = self.graph.regions[region_idx]
             s_minus = s_minus_list[i]
+            s_plus = s_plus_list[i]
             w = w_list[i]
             delta = delta_list[i]
             
-            # Get mesh positions along trajectory
-            mesh_positions = self.mesh_sampler(s_minus, w, delta)
-            
-            # Safety at each mesh point
-            margin = self.config.safety_margin
-            
-            # Convert A and b to CasADi DM for proper matrix ops
             A_dm = ca.DM(region.A)
             b_dm = ca.DM(region.b)
+            boundary_tol = self.config.boundary_tolerance
+
+            # Entry and exit states may lie on the boundary.
+            for endpoint in (s_minus[:2], s_plus[:2]):
+                closure_violation = ca.mtimes(A_dm, endpoint) - b_dm - boundary_tol
+                g.append(closure_violation)
+                lbg.extend([-np.inf] * len(region.b))
+                ubg.extend([0.0] * len(region.b))
+
+            mesh_positions = self.mesh_sampler(s_minus, w, delta)
+            margin = self.config.safety_margin
             
-            for k in range(n_mesh):
-                pos = mesh_positions[k, :]  # 2D position (CasADi MX) shape (1,2)
-                
-                # A @ pos <= b - margin (use CasADi matrix multiplication)
-                # Need pos as column vector (2,1), so transpose
+            for k in _interior_mesh_indices(n_mesh):
+                pos = mesh_positions[k, :]
                 violation = ca.mtimes(A_dm, pos.T) - b_dm + margin
-                
                 g.append(violation)
                 lbg.extend([-np.inf] * len(region.b))
                 ubg.extend([0.0] * len(region.b))
@@ -385,14 +467,12 @@ class PathNLPSolver:
             lbg.extend([0.0] * n_x)
             ubg.extend([0.0] * n_x)
             
-            # Note: interface point membership in Q_u intersect Q_v is implicitly enforced
-            # by the safety constraints at mesh points (including endpoints).
-            # For regions that only touch (boundary intersection), explicit
-            # intersection constraints are too restrictive. Instead, we rely on:
-            # 1. Safety constraints in region u ensuring s_u^+ in Q_u
-            # 2. Safety constraints in region v ensuring s_v^- in Q_v
-            # 3. Coupling s_u^+ = s_v^- ensuring they're the same point
-            # This naturally forces the interface point to be in Q_u intersect Q_v.
+            # Interface membership is enforced by:
+            # 1. endpoint closure of s_u^+ in Q_u
+            # 2. endpoint closure of s_v^- in Q_v
+            # 3. coupling s_u^+ = s_v^-
+            # This works for both overlapping regions and regions that only
+            # touch on a shared boundary.
         
         # -----------------------------------------------------------------
         # Boundary conditions
@@ -526,6 +606,7 @@ class PathNLPSolver:
             self.dynamics, self.control_param,
             self.config.n_integration_steps
         )
+        mesh_tau = np.linspace(0.0, 1.0, self.config.n_mesh_points)
         
         for region_idx in path_regions:
             s_minus = result.entry_states[region_idx]
@@ -534,6 +615,10 @@ class PathNLPSolver:
             
             traj, tau = integrator.integrate_with_trajectory(s_minus, w, delta)
             result.trajectories.append((traj, tau, delta))
+            mesh_positions = np.array(
+                self.mesh_sampler(s_minus, w, delta), dtype=float
+            )
+            result.mesh_samples.append((mesh_positions, mesh_tau.copy(), delta))
         
         # Interface points
         for i in range(len(path_regions) - 1):
@@ -653,20 +738,7 @@ class IntegratedMIOCPSolver:
                          start_state: np.ndarray,
                          goal_state: np.ndarray) -> np.ndarray:
         """Representative 2D anchor point for a graph edge."""
-        u, v = edge
-        
-        if u == SOURCE:
-            return np.asarray(start_state[:2], dtype=np.float64)
-        if v == TARGET:
-            return np.asarray(goal_state[:2], dtype=np.float64)
-        
-        intersection = self.graph.intersections.get(edge)
-        if intersection is not None:
-            return np.asarray(intersection.get_centroid(), dtype=np.float64)
-        
-        u_centroid = self.graph.get_region_by_id(u).get_centroid()
-        v_centroid = self.graph.get_region_by_id(v).get_centroid()
-        return 0.5 * (u_centroid + v_centroid)
+        return _get_graph_edge_anchor(self.graph, edge, start_state, goal_state)
     
     def _compute_warm_start_path(self, start_state: np.ndarray,
                                  goal_state: np.ndarray) -> List[str]:
@@ -690,6 +762,74 @@ class IntegratedMIOCPSolver:
             return nx.shortest_path(self.graph.graph, SOURCE, TARGET, weight=edge_weight)
         except nx.NetworkXNoPath:
             return []
+
+    def _iter_candidate_paths(self, start_state: np.ndarray,
+                              goal_state: np.ndarray,
+                              max_candidates: int) -> List[List[str]]:
+        """Generate a small set of centroid-shortest source-target paths."""
+        import networkx as nx
+
+        def edge_weight(u: str, v: str, _attrs: Dict) -> float:
+            if u == SOURCE:
+                p1 = start_state[:2]
+            else:
+                p1 = self.graph.get_region_by_id(u).get_centroid()
+
+            if v == TARGET:
+                p2 = goal_state[:2]
+            else:
+                p2 = self.graph.get_region_by_id(v).get_centroid()
+
+            return float(np.linalg.norm(p2 - p1))
+
+        candidates = []
+        try:
+            for path in nx.shortest_simple_paths(
+                self.graph.graph,
+                SOURCE,
+                TARGET,
+                weight=edge_weight
+            ):
+                candidates.append(path)
+                if len(candidates) >= max_candidates:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return []
+
+        return candidates
+
+    def _fallback_fixed_path_search(self,
+                                    start_state: np.ndarray,
+                                    goal_state: np.ndarray,
+                                    relaxation_result: OptimizationResult,
+                                    excluded_paths: List[List[str]]) -> Optional[OptimizationResult]:
+        """Try a few nearby discrete paths when the relaxed path cannot be polished."""
+        excluded = {tuple(path) for path in excluded_paths}
+
+        for candidate_path in self._iter_candidate_paths(
+            start_state,
+            goal_state,
+            self.config.max_polish_path_candidates
+        ):
+            if tuple(candidate_path) in excluded:
+                continue
+
+            candidate_result = self.path_solver.solve_path(
+                candidate_path,
+                start_state,
+                goal_state
+            )
+            candidate_result.max_integrality_gap = relaxation_result.max_integrality_gap
+            candidate_result.n_paths_evaluated = relaxation_result.n_paths_evaluated + 1
+
+            if candidate_result.success:
+                candidate_result.solver_status = (
+                    f"{relaxation_result.solver_status} + fallback fixed-path NLP: "
+                    f"{candidate_result.solver_status}"
+                )
+                return candidate_result
+
+        return None
     
     def _compute_constraint_violation(self, g_val: np.ndarray,
                                       lbg: List[float],
@@ -766,7 +906,27 @@ class IntegratedMIOCPSolver:
         Convert a relaxed integrated solution into a continuous fixed-path NLP
         solution for the extracted discrete path.
         """
-        polished = self.path_solver.solve_path(path, start_state, goal_state)
+        warm_start = {}
+        for region_idx in relaxation_result.path_regions:
+            if (
+                region_idx in relaxation_result.entry_states and
+                region_idx in relaxation_result.exit_states and
+                region_idx in relaxation_result.control_params and
+                region_idx in relaxation_result.time_durations
+            ):
+                warm_start[region_idx] = {
+                    's_minus': relaxation_result.entry_states[region_idx],
+                    's_plus': relaxation_result.exit_states[region_idx],
+                    'w': relaxation_result.control_params[region_idx],
+                    'delta': relaxation_result.time_durations[region_idx],
+                }
+
+        polished = self.path_solver.solve_path(
+            path,
+            start_state,
+            goal_state,
+            warm_start=warm_start or None
+        )
         polished.max_integrality_gap = relaxation_result.max_integrality_gap
         
         if polished.success:
@@ -780,6 +940,16 @@ class IntegratedMIOCPSolver:
             f"{relaxation_result.solver_status} | fixed-path NLP polish failed: "
             f"{polished.solver_status}"
         )
+        fallback_result = self._fallback_fixed_path_search(
+            start_state,
+            goal_state,
+            relaxation_result,
+            excluded_paths=[path]
+        )
+        if fallback_result is not None:
+            return fallback_result
+
+        relaxation_result.success = False
         return relaxation_result
     
     def solve(self, start_state: np.ndarray, goal_state: np.ndarray,
@@ -1054,19 +1224,28 @@ class IntegratedMIOCPSolver:
             )
             add_leq(local_cost - rho)
         
-        # On/off safety and region membership via Big-M.
+        # On/off region geometry via Big-M. Interior mesh points keep a strict
+        # safety margin, while entry/exit/interface points are allowed on the
+        # boundary so touching regions remain feasible.
         for node_id in region_nodes:
             region = self.graph.get_region_by_id(node_id)
             p = p_vars[node_id]
             s_minus = s_minus_vars[node_id]
+            s_plus = s_plus_vars[node_id]
             w = w_vars[node_id]
             delta = delta_vars[node_id]
             
             A_dm = ca.DM(region.A)
             b_dm = ca.DM(region.b)
+            boundary_tol = self.config.boundary_tolerance
+
+            for endpoint in (s_minus[:2], s_plus[:2]):
+                closure_violation = ca.mtimes(A_dm, endpoint) - b_dm - boundary_tol
+                add_leq(closure_violation - self.position_big_m * (1 - p))
+
             mesh_positions = self.mesh_sampler(s_minus, w, delta)
             
-            for k in range(n_mesh):
+            for k in _interior_mesh_indices(n_mesh):
                 pos = mesh_positions[k, :]
                 violation = ca.mtimes(A_dm, pos.T) - b_dm + self.config.safety_margin
                 add_leq(violation - self.position_big_m * (1 - p))
@@ -1079,14 +1258,17 @@ class IntegratedMIOCPSolver:
             
             add_leq(z - self.state_big_m * y)
             add_leq(-z - self.state_big_m * y)
-            
-            intersection = self.graph.intersections.get(edge)
-            if intersection is not None:
-                A_int = ca.DM(intersection.A)
-                b_int = ca.DM(intersection.b)
-                z_pos = z[:2]
-                violation = ca.mtimes(A_int, z_pos) - b_int + self.config.safety_margin
-                add_leq(violation - self.position_big_m * (1 - y))
+
+            region_u = self.graph.get_region_by_id(u)
+            region_v = self.graph.get_region_by_id(v)
+            z_pos = z[:2]
+            boundary_tol = self.config.boundary_tolerance
+
+            for region in (region_u, region_v):
+                A_dm = ca.DM(region.A)
+                b_dm = ca.DM(region.b)
+                closure_violation = ca.mtimes(A_dm, z_pos) - b_dm - boundary_tol
+                add_leq(closure_violation - self.position_big_m * (1 - y))
             
             diff_upstream = s_plus_vars[u] - z
             diff_downstream = s_minus_vars[v] - z
@@ -1190,6 +1372,7 @@ class IntegratedMIOCPSolver:
             self.dynamics, self.control_param,
             self.config.n_integration_steps
         )
+        mesh_tau = np.linspace(0.0, 1.0, self.config.n_mesh_points)
         
         for node_id in path[1:-1]:
             region_idx = int(node_id[1:])
@@ -1205,6 +1388,10 @@ class IntegratedMIOCPSolver:
             
             traj, tau = integrator.integrate_with_trajectory(s_minus, w, delta)
             result.trajectories.append((traj, tau, delta))
+            mesh_positions = np.array(
+                self.mesh_sampler(s_minus, w, delta), dtype=float
+            )
+            result.mesh_samples.append((mesh_positions, mesh_tau.copy(), delta))
         
         defect_norms = []
         for i in range(len(path) - 2):
@@ -1258,9 +1445,10 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         w_L=cost_config.get('w_L', 1.0),
         w_E=cost_config.get('w_E', 1.0),
         n_integration_steps=shooting_config.get('n_integration_steps', 20),
-        n_mesh_points=shooting_config.get('n_mesh_points', 10),
+        n_mesh_points=shooting_config.get('n_mesh_points', 5),
         n_control_segments=control_config.get('n_segments', 2),
         safety_margin=shooting_config.get('safety_margin', 0.02),
+        boundary_tolerance=shooting_config.get('boundary_tolerance', 1e-8),
         delta_min=dynamics_config.get('delta_min', 0.1),
         delta_max=dynamics_config.get('delta_max', 10.0),
         v_min=dynamics_config.get('v_min', -2.0),
@@ -1270,9 +1458,10 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         M_position=optimizer_config.get('big_M', {}).get('position', 20.0),
         M_interface=optimizer_config.get('big_M', {}).get('interface', 20.0),
         M_time=optimizer_config.get('big_M', {}).get('time', 100.0),
-        max_iter=optimizer_config.get('ipopt', {}).get('max_iter', 3000),
+        max_iter=optimizer_config.get('ipopt', {}).get('max_iter', 3500),
         tol=optimizer_config.get('ipopt', {}).get('tol', 1e-6),
         print_level=optimizer_config.get('ipopt', {}).get('print_level', 0),
+        max_polish_path_candidates=optimizer_config.get('path_polish_candidates', 3),
     )
     
     return IntegratedMIOCPSolver(graph, dynamics, opt_config)

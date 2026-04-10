@@ -96,34 +96,41 @@ class ConvexRegion:
         self.A = np.array(A_list)
         self.b = np.array(b_list)
     
-    def contains(self, point: np.ndarray, margin: float = 0.0) -> bool:
+    def contains(self, point: np.ndarray,
+                 margin: float = 0.0,
+                 tol: float = 1e-7) -> bool:
         """
         Check if point is inside the region.
         
         Args:
             point: 2D point [x, y]
             margin: Safety margin (positive = shrink region)
+            tol: Numerical slack for points that lie on the boundary up to
+                floating-point error
             
         Returns:
-            True if A @ point <= b - margin
+            True if A @ point <= b - margin + tol
         """
         point = np.asarray(point).flatten()[:2]
-        return np.all(self.A @ point <= self.b - margin)
+        return np.all(self.A @ point <= self.b - margin + tol)
     
-    def contains_batch(self, points: np.ndarray, margin: float = 0.0) -> np.ndarray:
+    def contains_batch(self, points: np.ndarray,
+                       margin: float = 0.0,
+                       tol: float = 1e-7) -> np.ndarray:
         """
         Check containment for multiple points.
         
         Args:
             points: Array of shape (N, 2)
             margin: Safety margin
+            tol: Numerical slack for points near the boundary
             
         Returns:
             Boolean array of shape (N,)
         """
         # A @ points.T has shape (n_constraints, N)
         violations = self.A @ points.T - (self.b - margin).reshape(-1, 1)
-        return np.all(violations <= 0, axis=0)
+        return np.all(violations <= tol, axis=0)
     
     def get_centroid(self) -> np.ndarray:
         """Compute centroid of the polygon."""

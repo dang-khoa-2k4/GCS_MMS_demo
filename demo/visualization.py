@@ -16,6 +16,7 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.colors import to_rgba
 from typing import List, Dict, Tuple, Optional
 import os
+import textwrap
 
 from convex_regions import ConvexRegion
 from graph_builder import RegionGraph, SOURCE, TARGET
@@ -109,6 +110,43 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
     ax.legend(loc='upper right')
 
 
+def _collect_mesh_points(result: OptimizationResult,
+                         fallback_points_per_segment: int = 5
+                         ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Collect interior mesh points and their physical times.
+
+    Uses exact solver mesh samples when available, with a trajectory-based
+    fallback for older results.
+    """
+    mesh_points = []
+    mesh_times = []
+    cumulative_time = 0.0
+
+    if result.mesh_samples:
+        for mesh_positions, mesh_tau, delta in result.mesh_samples:
+            if len(mesh_positions) > 2:
+                for idx in range(1, len(mesh_positions) - 1):
+                    mesh_points.append(mesh_positions[idx])
+                    mesh_times.append(cumulative_time + mesh_tau[idx] * delta)
+            cumulative_time += delta
+    else:
+        for traj, tau, delta in result.trajectories:
+            sample_count = min(fallback_points_per_segment, len(traj))
+            if sample_count > 2:
+                indices = np.linspace(0, len(traj) - 1, sample_count, dtype=int)
+                indices = np.unique(indices)
+                for idx in indices[1:-1]:
+                    mesh_points.append(traj[idx, :2])
+                    mesh_times.append(cumulative_time + tau[idx] * delta)
+            cumulative_time += delta
+
+    if not mesh_points:
+        return np.empty((0, 2)), np.empty((0,))
+
+    return np.array(mesh_points), np.array(mesh_times)
+
+
 def plot_trajectory(ax, result: OptimizationResult, regions: List[ConvexRegion],
                     show_mesh_points: bool = True,
                     show_interface_points: bool = True,
@@ -173,15 +211,8 @@ def plot_trajectory(ax, result: OptimizationResult, regions: List[ConvexRegion],
     
     # Mesh points (sample from trajectories)
     if show_mesh_points:
-        mesh_pts = []
-        for traj, tau, delta in result.trajectories:
-            n_mesh = 5  # Show subset of mesh points
-            indices = np.linspace(0, len(traj) - 1, n_mesh, dtype=int)
-            for idx in indices[1:-1]:  # Skip endpoints
-                mesh_pts.append(traj[idx, :2])
-        
-        if mesh_pts:
-            mesh_pts = np.array(mesh_pts)
+        mesh_pts, _ = _collect_mesh_points(result)
+        if len(mesh_pts) > 0:
             ax.scatter(mesh_pts[:, 0], mesh_pts[:, 1],
                       c='#9C27B0', s=30, marker='o', zorder=6,
                       alpha=0.6, label='Mesh Points')
@@ -276,52 +307,64 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
     if result.success:
         plot_trajectory(ax_main, result, graph.regions)
     
-    ax_main.set_title(f"{title}\n{'Success' if result.success else 'Failed'}: {result.solver_status}")
+    ax_main.set_title(f"{title}\n{'Success' if result.success else 'Failed'}")
     ax_main.set_xlabel("x [m]")
     ax_main.set_ylabel("y [m]")
     
     # Info panel
     ax_info = fig.add_subplot(2, 2, 2)
     ax_info.axis('off')
-    
+
+    path_labels = []
+    for node_id in result.path:
+        if node_id.startswith("R"):
+            region_idx = int(node_id[1:])
+            delta = result.time_durations.get(region_idx)
+            if delta is not None:
+                path_labels.append(f"{node_id} [{delta:.2f}s]")
+                continue
+        path_labels.append(node_id)
+
+    path_text = ' -> '.join(path_labels) if path_labels else 'N/A'
+    path_lines = textwrap.wrap(path_text, width=30, break_long_words=False) or ['N/A']
+
     info_text = [
-        "===============================",
-        "      OPTIMIZATION RESULTS      ",
-        "===============================",
-        f"Status: {'Success' if result.success else 'Failed'}",
-        f"Solver: {result.solver_status}",
-        "",
-        f"Total Cost: {result.total_cost:.4f}",
-        f"Solve Time: {result.solve_time:.3f} s",
-        f"Paths Evaluated: {result.n_paths_evaluated}",
-        "",
-        "Path:",
-        f"  {' -> '.join(result.path) if result.path else 'N/A'}",
-        "",
-        "Defect Norm: {:.2e}".format(result.defect_norm),
-        "Max Connection Gap: {:.2e}".format(result.max_connection_gap),
-        "Max Constraint Viol: {:.2e}".format(result.constraint_violation),
+        "Optimization",
+        f"Status  {'OK' if result.success else 'FAIL'}",
+        f"Cost    {result.total_cost:.4f}",
+        f"Solve   {result.solve_time:.3f} s",
+        f"Paths   {result.n_paths_evaluated}",
+        f"Defect  {result.defect_norm:.2e}",
+        f"Gap     {result.max_connection_gap:.2e}",
+        f"Viol    {result.constraint_violation:.2e}",
     ]
-    
+
     if result.max_integrality_gap > 0.0:
-        info_text.append(
-            "Max Integrality Gap: {:.2e}".format(result.max_integrality_gap)
-        )
-    
+        info_text.append(f"IntGap  {result.max_integrality_gap:.2e}")
+
+    info_text.extend([
+        "",
+        "Path",
+        *path_lines,
+    ])
+
+    if result.solver_status:
+        info_text.extend([
+            "",
+            "Solver",
+            *textwrap.wrap(result.solver_status, width=30, break_long_words=False),
+        ])
+
     if result.success:
         total_time = sum(result.time_durations.values())
         info_text.extend([
             "",
-            f"Total Duration: {total_time:.3f} s",
-            "",
-            "Per-Region Times:",
+            f"Duration {total_time:.3f} s",
         ])
-        for idx in result.path_regions:
-            info_text.append(f"  R{idx}: delta = {result.time_durations[idx]:.3f} s")
-    
+
     ax_info.text(0.05, 0.95, '\n'.join(info_text),
                 transform=ax_info.transAxes,
-                fontfamily='monospace', fontsize=9,
+                fontfamily='monospace', fontsize=8.5,
                 verticalalignment='top')
     
     # Trajectory profile
@@ -362,7 +405,8 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
                      workspace_bounds: Tuple[float, float, float, float],
                      start_pos: np.ndarray, goal_pos: np.ndarray,
                      filename: str, fps: int = 30,
-                     duration: float = 5.0) -> None:
+                     duration: float = 5.0,
+                     show_mesh_points: bool = True) -> None:
     """
     Create trajectory animation as GIF.
     
@@ -374,9 +418,13 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
         filename: Output filename
         fps: Frames per second
         duration: Animation duration in seconds
+        show_mesh_points: Whether to display interior mesh points in the GIF
     """
     if not result.success:
         print("Cannot create animation: optimization failed")
+        return
+    if not result.trajectories:
+        print("Cannot create animation: no trajectory data available")
         return
     
     setup_plot_style()
@@ -404,14 +452,17 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
     all_points = np.array(all_points)
     all_times = np.array(all_times)
     all_headings = np.array(all_headings)
+    mesh_points, mesh_times = _collect_mesh_points(result)
     
     # Total trajectory time
     total_time = all_times[-1]
-    n_frames = int(fps * duration)
+    n_frames = max(2, int(fps * duration))
     
     # Animation elements
     robot_marker, = ax.plot([], [], 'bo', markersize=12, zorder=10)
     trail_line, = ax.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=5)
+    mesh_scatter = ax.scatter([], [], c='#9C27B0', s=35, marker='o',
+                              zorder=6, alpha=0.75, label='Mesh Points')
     heading_arrow = ax.annotate('', xy=(0, 0), xytext=(0, 0),
                                 arrowprops=dict(arrowstyle='->', color='blue', lw=2))
     time_text = ax.text(0.02, 0.98, '', transform=ax.transAxes,
@@ -421,14 +472,15 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
     def init():
         robot_marker.set_data([], [])
         trail_line.set_data([], [])
+        mesh_scatter.set_offsets(np.empty((0, 2)))
         heading_arrow.set_position((0, 0))
         heading_arrow.xy = (0, 0)
         time_text.set_text('')
-        return robot_marker, trail_line, heading_arrow, time_text
+        return robot_marker, trail_line, mesh_scatter, heading_arrow, time_text
     
     def animate(frame):
         # Current animation time (mapped to trajectory time)
-        t_anim = frame / n_frames * duration
+        t_anim = frame / (n_frames - 1) * duration
         t_traj = t_anim / duration * total_time
         
         # Find position at current time
@@ -449,6 +501,13 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
         # Update trail (all points up to current)
         trail_idx = idx + 1
         trail_line.set_data(all_points[:trail_idx, 0], all_points[:trail_idx, 1])
+
+        # Show mesh points that have been reached so far
+        if show_mesh_points and len(mesh_points) > 0:
+            visible_mesh = mesh_points[mesh_times <= t_traj + 1e-10]
+            mesh_scatter.set_offsets(visible_mesh if len(visible_mesh) > 0 else np.empty((0, 2)))
+        else:
+            mesh_scatter.set_offsets(np.empty((0, 2)))
         
         # Update heading arrow
         arrow_len = 0.2
@@ -460,7 +519,7 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
         # Update time text
         time_text.set_text(f't = {t_traj:.2f} s')
         
-        return robot_marker, trail_line, heading_arrow, time_text
+        return robot_marker, trail_line, mesh_scatter, heading_arrow, time_text
     
     anim = FuncAnimation(fig, animate, init_func=init,
                         frames=n_frames, interval=1000/fps, blit=True)

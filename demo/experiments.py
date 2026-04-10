@@ -14,6 +14,8 @@ from app_config import DemoConfig
 from optimizer import OptimizationResult
 from scenario_builder import PreparedScenario, prepare_scenario
 
+from matplotlib import pyplot as plt
+
 
 @dataclass
 class ExperimentResult:
@@ -150,6 +152,7 @@ class ExperimentRunner:
                     prepared.resolved.goal_state[:2],
                     title=f"GCS-MMS: {prepared.resolved.name}",
                 )
+                plt.show()
                 fig.savefig(f"{prefix}_result.png")
                 print(f"Saved: {prefix}_result.png")
 

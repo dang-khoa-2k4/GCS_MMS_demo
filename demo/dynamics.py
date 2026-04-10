@@ -185,6 +185,22 @@ class ControlParameterization:
         
         # Parameter dimension
         self.n_w = n_u * self.n_segments
+        self.soft_switch_sharpness = 50.0
+
+    def _smooth_segment_weights_numpy(self, tau: float) -> np.ndarray:
+        """Mirror the CasADi soft segment activation in NumPy."""
+        weights = np.zeros(self.n_segments, dtype=np.float64)
+        sharpness = self.soft_switch_sharpness
+
+        for seg in range(self.n_segments):
+            t_start = seg / self.n_segments
+            t_end = (seg + 1) / self.n_segments
+
+            weight_start = 1.0 / (1.0 + np.exp(-sharpness * (tau - t_start)))
+            weight_end = 1.0 / (1.0 + np.exp(-sharpness * (t_end - tau)))
+            weights[seg] = weight_start * weight_end
+
+        return weights
     
     def evaluate(self, tau: float, w: np.ndarray) -> np.ndarray:
         """
@@ -201,10 +217,15 @@ class ControlParameterization:
             return w[:self.n_u]
         
         elif self.parameterization == "piecewise_constant":
-            # Determine which segment
-            segment_idx = min(int(tau * self.n_segments), self.n_segments - 1)
-            start_idx = segment_idx * self.n_u
-            return w[start_idx:start_idx + self.n_u]
+            result = np.zeros(self.n_u, dtype=np.float64)
+            weights = self._smooth_segment_weights_numpy(float(tau))
+
+            for seg, weight in enumerate(weights):
+                start_idx = seg * self.n_u
+                u_seg = w[start_idx:start_idx + self.n_u]
+                result = result + weight * u_seg
+
+            return result
         
         else:
             raise ValueError(f"Unknown parameterization: {self.parameterization}")
@@ -223,6 +244,7 @@ class ControlParameterization:
             # Use weighted combination with soft switching
             # This is an approximation for optimization purposes
             result = ca.MX.zeros(self.n_u)
+            sharpness = self.soft_switch_sharpness
             
             for seg in range(self.n_segments):
                 # Segment boundaries
@@ -230,7 +252,6 @@ class ControlParameterization:
                 t_end = (seg + 1) / self.n_segments
                 
                 # Soft indicator function (sigmoid-like)
-                sharpness = 50.0
                 weight_start = 1 / (1 + ca.exp(-sharpness * (tau - t_start)))
                 weight_end = 1 / (1 + ca.exp(-sharpness * (t_end - tau)))
                 weight = weight_start * weight_end
