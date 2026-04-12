@@ -172,10 +172,11 @@ def main() -> None:
         epilog="""
 Examples:
   python main_demo.py
-  python main_demo.py --scenario simple
-  python main_demo.py --scenario medium --quiet
+  python main_demo.py --scenario default
+  python main_demo.py --scenario default --quiet
+  python main_demo.py --scenario maze
   python main_demo.py --list-presets
-  python main_demo.py --visualize-only --scenario simple
+  python main_demo.py --visualize-only --scenario default
   python main_demo.py --config config.yaml --quick-test
   python main_demo.py --maze-benchmark --maze-count 5 --maze-size 25 --maze-knock-downs 25 --maze-seed 4
   python main_demo.py --maze-benchmark --maze-debug-geometry --maze-count 1 --maze-size 25 --maze-knock-downs 25 --maze-seed 4
