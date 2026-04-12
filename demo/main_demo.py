@@ -41,6 +41,7 @@ def visualize_environment_only(config_path: str, scenario_name: str | None = Non
         prepared.regions,
         prepared.resolved.start_state[:2],
         prepared.resolved.goal_state[:2],
+        obstacles=prepared.environment.obstacles,
         show_labels=True,
         alpha=0.4,
     )
@@ -54,6 +55,7 @@ def visualize_environment_only(config_path: str, scenario_name: str | None = Non
         prepared.regions,
         prepared.resolved.start_state[:2],
         prepared.resolved.goal_state[:2],
+        obstacles=prepared.environment.obstacles,
         show_labels=True,
         alpha=0.2,
     )
@@ -98,6 +100,30 @@ def run_all_experiments(config_path: str, verbose: bool = True):
     print(f"  Results saved to: {runner.output_dir}/")
     print("=" * 70)
     return results
+
+
+def run_maze_benchmark(config_path: str,
+                       scenario_name: str | None,
+                       count: int,
+                       maze_size: int,
+                       knock_downs: int,
+                       seed_start: int,
+                       wall_thickness: float,
+                       save_debug_geometry: bool,
+                       verbose: bool = True):
+    """Benchmark the solver on randomly generated maze instances."""
+    from maze_benchmark import MazeBenchmarkRunner
+
+    runner = MazeBenchmarkRunner(config_path=config_path, template_scenario=scenario_name)
+    return runner.run(
+        count=count,
+        maze_size=maze_size,
+        knock_downs=knock_downs,
+        seed_start=seed_start,
+        wall_thickness=wall_thickness,
+        save_debug_geometry=save_debug_geometry,
+        verbose=verbose,
+    )
 
 
 def print_formulation_summary() -> None:
@@ -151,6 +177,8 @@ Examples:
   python main_demo.py --list-presets
   python main_demo.py --visualize-only --scenario simple
   python main_demo.py --config config.yaml --quick-test
+  python main_demo.py --maze-benchmark --maze-count 5 --maze-size 25 --maze-knock-downs 25 --maze-seed 4
+  python main_demo.py --maze-benchmark --maze-debug-geometry --maze-count 1 --maze-size 25 --maze-knock-downs 25 --maze-seed 4
         """,
     )
 
@@ -161,6 +189,13 @@ Examples:
     parser.add_argument("--formulation", action="store_true", help="Print formulation summary")
     parser.add_argument("--list-presets", action="store_true", help="List available geometry presets")
     parser.add_argument("--list-scenarios", action="store_true", help="List available scenarios")
+    parser.add_argument("--maze-benchmark", action="store_true", help="Benchmark randomly generated maze instances")
+    parser.add_argument("--maze-count", type=int, default=5, help="Number of random mazes to benchmark")
+    parser.add_argument("--maze-size", type=int, default=25, help="Maze width/height in cells")
+    parser.add_argument("--maze-knock-downs", type=int, default=25, help="Extra random wall removals after maze generation")
+    parser.add_argument("--maze-seed", type=int, default=4, help="Starting random seed for maze generation")
+    parser.add_argument("--maze-wall-thickness", type=float, default=0.08, help="Thickness of generated interior maze walls")
+    parser.add_argument("--maze-debug-geometry", action="store_true", help="Save workspace + hole geometry plots before ACD")
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
 
     args = parser.parse_args()
@@ -192,6 +227,20 @@ Examples:
         from experiments import run_quick_test
 
         run_quick_test(args.config, args.scenario)
+        return
+
+    if args.maze_benchmark:
+        run_maze_benchmark(
+            config_path=args.config,
+            scenario_name=args.scenario,
+            count=args.maze_count,
+            maze_size=args.maze_size,
+            knock_downs=args.maze_knock_downs,
+            seed_start=args.maze_seed,
+            wall_thickness=args.maze_wall_thickness,
+            save_debug_geometry=args.maze_debug_geometry,
+            verbose=not args.quiet,
+        )
         return
 
     if args.scenario:

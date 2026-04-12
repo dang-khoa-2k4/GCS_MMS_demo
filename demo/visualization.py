@@ -36,9 +36,20 @@ def setup_plot_style():
     })
 
 
+def _polygon_vertices(polygon_like) -> np.ndarray:
+    """Convert a shapely polygon or raw vertex array into plot-ready vertices."""
+    if hasattr(polygon_like, "exterior"):
+        vertices = np.asarray(polygon_like.exterior.coords, dtype=np.float64)
+        if len(vertices) > 1 and np.allclose(vertices[0], vertices[-1]):
+            return vertices[:-1]
+        return vertices
+    return np.asarray(polygon_like, dtype=np.float64)
+
+
 def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
                      regions: List[ConvexRegion],
                      start_pos: np.ndarray, goal_pos: np.ndarray,
+                     obstacles: Optional[List[object]] = None,
                      highlight_regions: Optional[List[int]] = None,
                      show_labels: bool = True,
                      alpha: float = 0.3):
@@ -51,6 +62,7 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
         regions: List of ConvexRegion objects
         start_pos: Start position [x, y]
         goal_pos: Goal position [x, y]
+        obstacles: Obstacle polygons to overlay
         highlight_regions: Region indices to highlight (path)
         show_labels: Whether to show region labels
         alpha: Transparency for regions
@@ -89,14 +101,29 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
             linewidth=edge_width
         )
         ax.add_patch(poly)
-        
+
         # Label
         if show_labels:
             centroid = region.get_centroid()
             ax.text(centroid[0], centroid[1], f'R{region.index}',
                    ha='center', va='center', fontsize=8,
                    fontweight='bold' if highlight_regions and region.index in highlight_regions else 'normal')
-    
+
+    # Overlay obstacles explicitly so blocked space is easy to see.
+    for obstacle_idx, obstacle in enumerate(obstacles or []):
+        obstacle_patch = patches.Polygon(
+            _polygon_vertices(obstacle),
+            closed=True,
+            facecolor='#404040',
+            edgecolor='#f5f5f5',
+            linewidth=1.2,
+            hatch='///',
+            alpha=0.95,
+            zorder=4,
+            label='Obstacle' if obstacle_idx == 0 else None,
+        )
+        ax.add_patch(obstacle_patch)
+
     # Plot start and goal
     ax.plot(start_pos[0], start_pos[1], 'go', markersize=15, 
             label='Start', zorder=10, markeredgecolor='darkgreen', markeredgewidth=2)
@@ -275,6 +302,7 @@ def plot_graph_structure(ax, graph: RegionGraph,
 def create_result_figure(result: OptimizationResult, graph: RegionGraph,
                          workspace_bounds: Tuple[float, float, float, float],
                          start_pos: np.ndarray, goal_pos: np.ndarray,
+                         obstacles: Optional[List[object]] = None,
                          title: str = "GCS-MMS Motion Planning Result",
                          figsize: Tuple[int, int] = (12, 10)) -> plt.Figure:
     """
@@ -285,6 +313,7 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
         graph: RegionGraph
         workspace_bounds: Environment bounds
         start_pos, goal_pos: Start and goal positions
+        obstacles: Obstacle polygons to overlay
         title: Figure title
         figsize: Figure size
         
@@ -301,6 +330,7 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
     # Plot environment
     plot_environment(ax_main, workspace_bounds, graph.regions,
                      start_pos, goal_pos,
+                     obstacles=obstacles,
                      highlight_regions=result.path_regions if result.success else None)
     
     # Plot trajectory
@@ -404,7 +434,9 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
 def create_animation(result: OptimizationResult, graph: RegionGraph,
                      workspace_bounds: Tuple[float, float, float, float],
                      start_pos: np.ndarray, goal_pos: np.ndarray,
-                     filename: str, fps: int = 30,
+                     filename: str,
+                     obstacles: Optional[List[object]] = None,
+                     fps: int = 30,
                      duration: float = 5.0,
                      show_mesh_points: bool = True) -> None:
     """
@@ -415,6 +447,7 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
         graph: RegionGraph
         workspace_bounds: Environment bounds
         start_pos, goal_pos: Start and goal positions
+        obstacles: Obstacle polygons to overlay
         filename: Output filename
         fps: Frames per second
         duration: Animation duration in seconds
@@ -434,6 +467,7 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
     # Static background
     plot_environment(ax, workspace_bounds, graph.regions,
                      start_pos, goal_pos,
+                     obstacles=obstacles,
                      highlight_regions=result.path_regions)
     
     # Collect trajectory points with time

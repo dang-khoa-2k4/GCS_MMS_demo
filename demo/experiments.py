@@ -150,6 +150,7 @@ class ExperimentRunner:
                     prepared.workspace_bounds,
                     prepared.resolved.start_state[:2],
                     prepared.resolved.goal_state[:2],
+                    obstacles=prepared.environment.obstacles,
                     title=f"GCS-MMS: {prepared.resolved.name}",
                 )
                 plt.show()
@@ -164,7 +165,8 @@ class ExperimentRunner:
                         prepared.workspace_bounds,
                         prepared.resolved.start_state[:2],
                         prepared.resolved.goal_state[:2],
-                        f"{prefix}_animation.gif",
+                        filename=f"{prefix}_animation.gif",
+                        obstacles=prepared.environment.obstacles,
                         fps=prepared.resolved.runtime_config.get("visualization", {}).get("animation", {}).get("fps", 30),
                         duration=prepared.resolved.runtime_config.get("visualization", {}).get("animation", {}).get("duration", 5.0),
                     )

@@ -163,7 +163,7 @@ scenarios:
     problem_preset: "maze"
     overrides:
       shooting:
-        n_mesh_points: 5
+        n_mesh_points: 3
 
 # -----------------------------------------------------------------------------
 # Output Configuration

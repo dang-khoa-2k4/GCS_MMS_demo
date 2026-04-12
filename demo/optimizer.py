@@ -759,6 +759,7 @@ class IntegratedMIOCPSolver:
             return float(np.linalg.norm(p2 - p1))
         
         try:
+            # centroid-distance shortest path as warm start
             return nx.shortest_path(self.graph.graph, SOURCE, TARGET, weight=edge_weight)
         except nx.NetworkXNoPath:
             return []
@@ -1445,7 +1446,7 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         w_L=cost_config.get('w_L', 1.0),
         w_E=cost_config.get('w_E', 1.0),
         n_integration_steps=shooting_config.get('n_integration_steps', 20),
-        n_mesh_points=shooting_config.get('n_mesh_points', 5),
+        n_mesh_points=shooting_config.get('n_mesh_points', 3),
         n_control_segments=control_config.get('n_segments', 2),
         safety_margin=shooting_config.get('safety_margin', 0.02),
         boundary_tolerance=shooting_config.get('boundary_tolerance', 1e-8),
