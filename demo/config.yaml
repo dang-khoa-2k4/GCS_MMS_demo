@@ -15,7 +15,7 @@
 # -----------------------------------------------------------------------------
 problem:
   # Geometry presets are registered in problem_data.py
-  default_preset: "default"
+  default_preset: "maze"
 
 # -----------------------------------------------------------------------------
 # Start and Goal States
@@ -163,7 +163,7 @@ scenarios:
     problem_preset: "maze"
     overrides:
       shooting:
-        n_mesh_points: 3
+        n_mesh_points: 4
 
 # -----------------------------------------------------------------------------
 # Output Configuration

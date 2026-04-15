@@ -193,7 +193,7 @@ def plot_trajectory(ax, result: OptimizationResult, regions: List[ConvexRegion],
         trajectory_color: Color for trajectory line
         linewidth: Line width
     """
-    if not result.success or not result.trajectories:
+    if not result.trajectories:
         return
     
     # Collect all trajectory segments
@@ -331,10 +331,10 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
     plot_environment(ax_main, workspace_bounds, graph.regions,
                      start_pos, goal_pos,
                      obstacles=obstacles,
-                     highlight_regions=result.path_regions if result.success else None)
+                     highlight_regions=result.path_regions if result.path_regions else None)
     
     # Plot trajectory
-    if result.success:
+    if result.trajectories:
         plot_trajectory(ax_main, result, graph.regions)
     
     ax_main.set_title(f"{title}\n{'Success' if result.success else 'Failed'}")
@@ -453,9 +453,6 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
         duration: Animation duration in seconds
         show_mesh_points: Whether to display interior mesh points in the GIF
     """
-    if not result.success:
-        print("Cannot create animation: optimization failed")
-        return
     if not result.trajectories:
         print("Cannot create animation: no trajectory data available")
         return

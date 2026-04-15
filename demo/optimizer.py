@@ -209,6 +209,26 @@ class PathNLPSolver:
         self.local_cost_fn = create_casadi_local_cost(
             dynamics, self.control_param, config.n_integration_steps
         )
+
+        if graph.regions:
+            all_vertices = np.vstack([region.vertices for region in graph.regions])
+            self.position_lb = np.array(
+                [
+                    float(np.min(all_vertices[:, 0])) - 1e-6,
+                    float(np.min(all_vertices[:, 1])) - 1e-6,
+                ],
+                dtype=np.float64,
+            )
+            self.position_ub = np.array(
+                [
+                    float(np.max(all_vertices[:, 0])) + 1e-6,
+                    float(np.max(all_vertices[:, 1])) + 1e-6,
+                ],
+                dtype=np.float64,
+            )
+        else:
+            self.position_lb = np.array([-1e-6, -1e-6], dtype=np.float64)
+            self.position_ub = np.array([1e-6, 1e-6], dtype=np.float64)
     
     def solve_path(self, path: List[str], start_state: np.ndarray,
                    goal_state: np.ndarray,
@@ -331,9 +351,8 @@ class PathNLPSolver:
             s_minus_list.append(s_minus)
             
             # Bounds: position in region, angle free
-            centroid = region.get_centroid()
-            lbx.extend([0.0, 0.0, -2*np.pi])  # Relaxed position bounds
-            ubx.extend([5.0, 5.0, 2*np.pi])
+            lbx.extend([self.position_lb[0], self.position_lb[1], -2*np.pi])
+            ubx.extend([self.position_ub[0], self.position_ub[1], 2*np.pi])
             
             if warm is not None and 's_minus' in warm:
                 s_minus_init = np.asarray(warm['s_minus'], dtype=float).copy()
@@ -347,8 +366,8 @@ class PathNLPSolver:
             s_plus = ca.MX.sym(f's_plus_{i}', n_x)
             s_plus_list.append(s_plus)
             
-            lbx.extend([0.0, 0.0, -2*np.pi])
-            ubx.extend([5.0, 5.0, 2*np.pi])
+            lbx.extend([self.position_lb[0], self.position_lb[1], -2*np.pi])
+            ubx.extend([self.position_ub[0], self.position_ub[1], 2*np.pi])
             
             if warm is not None and 's_plus' in warm:
                 s_plus_init = np.asarray(warm['s_plus'], dtype=float).copy()
@@ -544,7 +563,8 @@ class PathNLPSolver:
         
         # Check solver status
         stats = solver.stats()
-        success = stats['success']
+        success = bool(stats.get('success', False))
+        return_status = stats.get('return_status', 'unknown')
         
         # Parse solution
         result = self._parse_solution(
@@ -554,7 +574,7 @@ class PathNLPSolver:
         
         result.success = success
         result.total_cost = float(sol['f'])
-        result.solver_status = "Optimal" if success else "Failed"
+        result.solver_status = return_status
         result.constraint_violation = _compute_bound_violation(
             np.array(sol['g']).flatten(),
             lbg,

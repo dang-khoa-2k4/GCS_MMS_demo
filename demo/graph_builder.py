@@ -5,7 +5,7 @@ Constructs graph G = (V, E) where:
 - V = V_r union {source, target} (region vertices + source + target)
 - E = E_rr union E_s union E_t (inter-region + source + target edges)
 
-Edges are created based on geometric adjacency (non-empty intersection).
+Edges are created based on geometric adjacency (shared edge or overlap).
 """
 
 import numpy as np
@@ -91,7 +91,7 @@ class RegionGraph:
                 self.graph.add_edge(node_id, TARGET, edge_type='target')
                 self.target_edges.append((node_id, TARGET))
         
-        # Add inter-region edges (u -> v if Q_u intersect Q_v is non-empty)
+        # Add inter-region edges (u -> v if Q_u and Q_v share an edge or overlap)
         n = len(self.regions)
         for i in range(n):
             for j in range(n):

@@ -24,7 +24,7 @@ from typing import Dict, Iterable, List, Optional
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
-from shapely.geometry import Polygon, box
+from shapely.geometry import Point, Polygon, box
 from shapely.ops import unary_union
 
 from acd2d.acd2d import ACD2D
@@ -35,6 +35,13 @@ from environment import create_environment_from_vertices
 from graph_builder import build_region_graph
 from models.maze import Maze
 from optimizer import create_integrated_optimizer_from_config
+from problem_data import PROBLEM_PRESETS
+from visualization import create_animation, create_result_figure, save_result_summary
+
+
+# Keep the random-maze pipeline aligned with scenario_builder.py.
+SCENARIO_BUILDER_ACD_TAU = 0.0
+SCENARIO_BUILDER_REGION_BUFFER = 1e-3
 
 
 @dataclass
@@ -48,7 +55,6 @@ class MazeBenchmarkCaseResult:
     n_wall_boxes: int
     n_regions: int
     n_edges: int
-    n_paths: int
     success: bool
     setup_time: float
     solve_time: float
@@ -64,6 +70,9 @@ class MazeBenchmarkCaseResult:
     free_space_coordinates_path: str | None = None
     obstacle_coordinates_path: str | None = None
     region_debug_path: str | None = None
+    result_summary_path: str | None = None
+    result_figure_path: str | None = None
+    result_animation_path: str | None = None
 
 
 def _generate_maze(seed_value: int, maze_size: int, knock_downs: int) -> Maze:
@@ -98,21 +107,41 @@ def _maze_wall_boxes(maze: Maze, wall_thickness: float) -> List[Polygon]:
         raise ValueError("wall_thickness must lie in (0, 1).")
 
     half_thickness = 0.5 * wall_thickness
-    wall_boxes: List[Polygon] = []
+    workspace_box = box(0.0, 0.0, float(maze.nx), float(maze.ny))
+    wall_boxes: List[Polygon] = [
+        # Treat the maze frame as true obstacle geometry instead of folding it
+        # into the workspace boundary. These strips stay fully inside the
+        # workspace so Environment.free_space captures the interior maze domain.
+        box(0.0, 0.0, wall_thickness, float(maze.ny)),
+        box(float(maze.nx) - wall_thickness, 0.0, float(maze.nx), float(maze.ny)),
+        box(0.0, 0.0, float(maze.nx), wall_thickness),
+        box(0.0, float(maze.ny) - wall_thickness, float(maze.nx), float(maze.ny)),
+    ]
 
     for x in range(maze.nx):
         for y in range(maze.ny):
             cell = maze.cell_at(x, y)
 
-            # Workspace boundary already closes the map; only add interior walls.
             if x < maze.nx - 1 and cell.walls["E"]:
-                wall_boxes.append(
-                    box(x + 1 - half_thickness, y, x + 1 + half_thickness, y + 1)
-                )
+                # Extend by half-thickness along the wall direction so right-angle
+                # joints are watertight instead of using butt-ended strips.
+                vertical_wall = box(
+                    x + 1 - half_thickness,
+                    y - half_thickness,
+                    x + 1 + half_thickness,
+                    y + 1 + half_thickness,
+                ).intersection(workspace_box)
+                if not vertical_wall.is_empty:
+                    wall_boxes.append(vertical_wall)
             if y < maze.ny - 1 and cell.walls["N"]:
-                wall_boxes.append(
-                    box(x, y + 1 - half_thickness, x + 1, y + 1 + half_thickness)
-                )
+                horizontal_wall = box(
+                    x - half_thickness,
+                    y + 1 - half_thickness,
+                    x + 1 + half_thickness,
+                    y + 1 + half_thickness,
+                ).intersection(workspace_box)
+                if not horizontal_wall.is_empty:
+                    wall_boxes.append(horizontal_wall)
 
     return wall_boxes
 
@@ -393,6 +422,8 @@ def _build_environment_and_regions(
     acd: ACD2D,
     workspace_vertices: List[List[float]],
     obstacle_vertices: List[List[List[float]]],
+    start_pos: np.ndarray,
+    goal_pos: np.ndarray,
     buffer_size: float = 1e-3,
 ):
     """Build an Environment and decompose it exactly like scenario_builder.py."""
@@ -401,24 +432,62 @@ def _build_environment_and_regions(
         obstacle_vertices,
     )
 
-    decomposition_error = None
-    acd_output = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(acd_output):
-            region_vertices, _result = acd.decompose_to_polygons(
-                environment.workspace,
-                holes=environment.obstacles,
-            )
-    except Exception as exc:
-        decomposition_error = exc
-        region_vertices = []
+    free_space_components = list(_iter_polygon_components(environment.free_space))
+    if not free_space_components:
+        raise RuntimeError("Maze free space is empty after applying obstacle geometry.")
+
+    start_point = Point(float(start_pos[0]), float(start_pos[1]))
+    goal_point = Point(float(goal_pos[0]), float(goal_pos[1]))
+
+    selected_components = [
+        component for component in free_space_components
+        if component.covers(start_point) or component.covers(goal_point)
+    ]
+    if not selected_components:
+        raise RuntimeError(
+            "Neither start nor goal lies inside any free-space component. "
+            "Boundary-wall obstacle generation likely blocks the configured states."
+        )
+
+    shared_components = [
+        component for component in selected_components
+        if component.covers(start_point) and component.covers(goal_point)
+    ]
+    if not shared_components:
+        raise RuntimeError(
+            "Start and goal lie in different free-space components after adding "
+            "independent boundary-wall obstacles."
+        )
+    selected_components = shared_components
+
+    region_vertices: List[np.ndarray] = []
+    decomposition_errors: List[str] = []
+    for component in selected_components:
+        component_workspace = np.asarray(component.exterior.coords[:-1], dtype=np.float64)
+        component_holes = [
+            np.asarray(interior.coords[:-1], dtype=np.float64)
+            for interior in component.interiors
+        ]
+
+        acd_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(acd_output):
+                component_regions, _result = acd.decompose_to_polygons(
+                    component_workspace,
+                    holes=component_holes,
+                )
+            region_vertices.extend(component_regions)
+        except Exception as exc:
+            acd_logs = acd_output.getvalue().strip()
+            detail = str(exc) if not acd_logs else f"{exc}\n{acd_logs}"
+            decomposition_errors.append(detail)
 
     if not region_vertices:
-        if decomposition_error is not None:
-            acd_logs = acd_output.getvalue().strip()
-            if acd_logs:
-                raise RuntimeError(f"ACD2D failed: {decomposition_error}\n{acd_logs}") from decomposition_error
-            raise RuntimeError(f"ACD2D failed: {decomposition_error}") from decomposition_error
+        if decomposition_errors:
+            raise RuntimeError(
+                "ACD2D failed on all selected free-space components:\n" +
+                "\n\n---\n\n".join(decomposition_errors)
+            )
         raise RuntimeError("ACD decomposition did not produce usable polygons.")
 
     regions = create_buffered_regions_from_vertices_list(
@@ -434,22 +503,71 @@ class MazeBenchmarkRunner:
 
     def __init__(self, config_path: str = "config.yaml", template_scenario: str | None = None):
         self.config = DemoConfig(config_path)
+        if template_scenario is None and "maze" in self.config.list_scenarios():
+            template_scenario = "maze"
         self.template_scenario = template_scenario or self.config.default_scenario_name()
         self.resolved = self.config.resolve_scenario(self.template_scenario)
+        self.template_preset = PROBLEM_PRESETS[self.resolved.problem_preset]
+        self.template_workspace_bounds = self._workspace_bounds(
+            self.template_preset.workspace_vertices
+        )
         self.output_dir = Path(self.config.output_dir) / "maze_benchmarks"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.debug_geometry_dir = self.output_dir / "geometry_debug"
+        self.result_artifact_dir = self.output_dir / "case_results"
+        self.result_artifact_dir.mkdir(parents=True, exist_ok=True)
 
         self.acd = ACD2D()
-        self.acd.set_parameters(tau=0.0)
+        self.acd.set_parameters(tau=SCENARIO_BUILDER_ACD_TAU)
+
+    @staticmethod
+    def _workspace_bounds(vertices: List[List[float]]) -> tuple[float, float, float, float]:
+        """Axis-aligned bounds for a workspace polygon."""
+        xs = [float(vertex[0]) for vertex in vertices]
+        ys = [float(vertex[1]) for vertex in vertices]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def _scale_position_from_template(
+        self,
+        position: np.ndarray,
+        maze_size: int,
+    ) -> np.ndarray:
+        """
+        Map a template-scenario position into the random maze workspace.
+
+        The benchmark workspace is always [0, maze_size]^2, while the template
+        scenario may come from a different workspace scale such as the 5x5
+        preset used by `python main_demo.py --scenario maze`.
+        """
+        x_min, y_min, x_max, y_max = self.template_workspace_bounds
+        width = max(x_max - x_min, 1e-9)
+        height = max(y_max - y_min, 1e-9)
+
+        frac_x = np.clip((float(position[0]) - x_min) / width, 0.0, 1.0)
+        frac_y = np.clip((float(position[1]) - y_min) / height, 0.0, 1.0)
+        return np.array(
+            [frac_x * float(maze_size), frac_y * float(maze_size)],
+            dtype=np.float64,
+        )
 
     def _build_states(self, maze_size: int) -> tuple[np.ndarray, np.ndarray]:
-        """Start and goal states consistent with the maze benchmark setup."""
-        start_pos = np.array([0.5, 0.0], dtype=np.float64)
-        goal_pos = np.array([maze_size - 0.5, float(maze_size)], dtype=np.float64)
-        heading = float(np.arctan2(goal_pos[1] - start_pos[1], goal_pos[0] - start_pos[0]))
-        start_state = np.array([start_pos[0], start_pos[1], heading], dtype=np.float64)
-        goal_state = np.array([goal_pos[0], goal_pos[1], heading], dtype=np.float64)
+        """Scale the template scenario's boundary conditions to the maze workspace."""
+        start_pos = self._scale_position_from_template(
+            self.resolved.start_state[:2],
+            maze_size,
+        )
+        goal_pos = self._scale_position_from_template(
+            self.resolved.goal_state[:2],
+            maze_size,
+        )
+        start_state = np.array(
+            [start_pos[0], start_pos[1], float(self.resolved.start_state[2])],
+            dtype=np.float64,
+        )
+        goal_state = np.array(
+            [goal_pos[0], goal_pos[1], float(self.resolved.goal_state[2])],
+            dtype=np.float64,
+        )
         return start_state, goal_state
 
     def _prepare_obstacle_vertices(
@@ -471,6 +589,90 @@ class MazeBenchmarkRunner:
         if verbose and has_interior_holes:
             print("[maze] Merged wall polygons contain holes; falling back to raw wall boxes.")
         return _raw_wall_box_vertices(wall_boxes), "raw-wall-boxes"
+
+    def _case_artifact_prefix(
+        self,
+        seed_value: int,
+        maze_size: int,
+        knock_downs: int,
+    ) -> Path:
+        """Stable filename prefix for one benchmark case."""
+        return (
+            self.result_artifact_dir /
+            f"maze_case_size{maze_size}_kd{knock_downs}_seed{seed_value}"
+        )
+
+    def _save_result_artifacts(
+        self,
+        result,
+        graph,
+        environment,
+        start_state: np.ndarray,
+        goal_state: np.ndarray,
+        seed_value: int,
+        maze_size: int,
+        knock_downs: int,
+        verbose: bool,
+    ) -> tuple[str | None, str | None, str | None]:
+        """
+        Persist benchmark result artifacts without affecting solver success.
+
+        Returns:
+            (summary_json_path, figure_png_path, animation_gif_path)
+        """
+        prefix = self._case_artifact_prefix(seed_value, maze_size, knock_downs)
+        summary_path = f"{prefix}_summary.json" if self.config.save_json else None
+        figure_path = f"{prefix}_result.png" if self.config.save_png else None
+        animation_path = f"{prefix}_animation.gif" if self.config.save_gif else None
+
+        workspace_bounds = environment.get_bounds()
+        if summary_path is not None:
+            save_result_summary(result, summary_path)
+
+        if figure_path is not None:
+            fig = create_result_figure(
+                result,
+                graph,
+                workspace_bounds,
+                start_state[:2],
+                goal_state[:2],
+                obstacles=environment.obstacles,
+                title=(
+                    f"Maze Benchmark: size={maze_size}, kd={knock_downs}, "
+                    f"seed={seed_value}"
+                ),
+            )
+            fig.savefig(figure_path)
+            plt.close(fig)
+
+        if animation_path is not None and result.trajectories:
+            create_animation(
+                result,
+                graph,
+                workspace_bounds,
+                start_state[:2],
+                goal_state[:2],
+                animation_path,
+                obstacles=environment.obstacles,
+                fps=self.resolved.runtime_config.get("visualization", {})
+                .get("animation", {})
+                .get("fps", 30),
+                duration=self.resolved.runtime_config.get("visualization", {})
+                .get("animation", {})
+                .get("duration", 5.0),
+            )
+        elif animation_path is not None:
+            animation_path = None
+
+        if verbose:
+            if summary_path is not None:
+                print(f"[maze seed={seed_value}] Saved result summary: {summary_path}")
+            if figure_path is not None:
+                print(f"[maze seed={seed_value}] Saved result figure: {figure_path}")
+            if animation_path is not None:
+                print(f"[maze seed={seed_value}] Saved result animation: {animation_path}")
+
+        return summary_path, figure_path, animation_path
 
     def run_case(
         self,
@@ -537,7 +739,9 @@ class MazeBenchmarkRunner:
                 self.acd,
                 workspace_vertices,
                 obstacle_vertices,
-                buffer_size=1e-3,
+                start_state[:2],
+                goal_state[:2],
+                buffer_size=SCENARIO_BUILDER_REGION_BUFFER,
             )
             if region_debug_path is not None:
                 _save_region_debug_plot(
@@ -555,8 +759,6 @@ class MazeBenchmarkRunner:
 
             graph = build_region_graph(regions, start_state[:2], goal_state[:2])
 
-            print("debug")
-
             dyn_cfg = self.resolved.runtime_config.get("dynamics", {})
             dynamics = UnicycleModel(
                 v_min=dyn_cfg.get("v_min", -2.0),
@@ -570,7 +772,6 @@ class MazeBenchmarkRunner:
                 self.resolved.runtime_config,
             )
 
-            print("solver")
             setup_time = time.time() - setup_start
             result = optimizer.solve(start_state, goal_state, verbose=verbose)
         except Exception as exc:
@@ -582,7 +783,6 @@ class MazeBenchmarkRunner:
                 n_wall_boxes=len(wall_boxes),
                 n_regions=0,
                 n_edges=0,
-                n_paths=0,
                 success=False,
                 setup_time=time.time() - setup_start,
                 solve_time=0.0,
@@ -602,14 +802,40 @@ class MazeBenchmarkRunner:
                     str(obstacle_coords_path) if obstacle_coords_path is not None else None
                 ),
                 region_debug_path=str(region_debug_path) if region_debug_path is not None else None,
+                result_summary_path=None,
+                result_figure_path=None,
+                result_animation_path=None,
             )
+
+        result_summary_path = None
+        result_figure_path = None
+        result_animation_path = None
+        try:
+            (
+                result_summary_path,
+                result_figure_path,
+                result_animation_path,
+            ) = self._save_result_artifacts(
+                result,
+                graph,
+                environment,
+                start_state,
+                goal_state,
+                seed_value,
+                maze_size,
+                knock_downs,
+                verbose,
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"[maze seed={seed_value}] Warning: could not save result artifacts: {exc}")
 
         if verbose:
             status = "OK" if result.success else "FAIL"
             print(
                 f"[maze seed={seed_value}] {status} | "
                 f"regions={len(regions)} edges={graph.graph.number_of_edges()} "
-                f"paths={n_paths} solve={result.solve_time:.3f}s"
+                f"solve={result.solve_time:.3f}s"
             )
             if geometry_debug_path is not None:
                 print(f"[maze seed={seed_value}] Saved geometry debug: {geometry_debug_path}")
@@ -627,7 +853,6 @@ class MazeBenchmarkRunner:
             n_wall_boxes=len(wall_boxes),
             n_regions=len(regions),
             n_edges=graph.graph.number_of_edges(),
-            n_paths=n_paths,
             success=result.success,
             setup_time=setup_time,
             solve_time=result.solve_time,
@@ -647,6 +872,9 @@ class MazeBenchmarkRunner:
                 str(obstacle_coords_path) if obstacle_coords_path is not None else None
             ),
             region_debug_path=str(region_debug_path) if region_debug_path is not None else None,
+            result_summary_path=result_summary_path,
+            result_figure_path=result_figure_path,
+            result_animation_path=result_animation_path,
         )
 
     @staticmethod

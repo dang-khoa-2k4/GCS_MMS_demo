@@ -41,23 +41,30 @@ class Maze:
     
     def plot(self, linewidth):
         plt.gca().axis('off')
-        
+
         # Pad the maze all around by this amount.
         width = self.nx
         height = self.ny
-        
+        plot_kwargs = {
+            'c': 'k',
+            'linewidth': linewidth,
+            'solid_capstyle': 'projecting',
+            'solid_joinstyle': 'miter',
+            'antialiased': False,
+        }
+
         # Draw the South and West maze borders.
         for x in range(self.nx):
             for y in range(self.ny):
                 if self.cell_at(x, y).walls['S'] and (x != 0 or y != 0):
-                    plt.plot([x, x + 1], [y, y], c='k', linewidth=linewidth)
+                    plt.plot([x, x + 1], [y, y], **plot_kwargs)
                 if self.cell_at(x, y).walls['W']:
-                    plt.plot([x, x], [y, y + 1], c='k', linewidth=linewidth)
-                    
+                    plt.plot([x, x], [y, y + 1], **plot_kwargs)
+
         # Draw the North and East maze border, which won't have been drawn
         # by the procedure above.
-        plt.plot([0, width - 1], [height, height], c='k', linewidth=linewidth)
-        plt.plot([width, width], [0, height], c='k', linewidth=linewidth)
+        plt.plot([0, width], [height, height], **plot_kwargs)
+        plt.plot([width, width], [0, height], **plot_kwargs)
         
     def find_valid_neighbours(self, cell):
         """Return a list of unvisited neighbours to cell."""

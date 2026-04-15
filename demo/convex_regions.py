@@ -165,25 +165,59 @@ class ConvexRegion:
         return self.get_centroid()
 
 
+def _supports_region_transition(geometry,
+                                min_area: float = 1e-10,
+                                min_shared_length: float = 1e-10) -> bool:
+    """
+    Return True when an intersection has a traversable interface.
+
+    We accept:
+    - positive-area overlap
+    - shared boundary segment with positive length
+
+    We reject:
+    - isolated point contacts
+    """
+    if geometry.is_empty:
+        return False
+
+    geom_type = geometry.geom_type
+
+    if geom_type == 'Polygon':
+        return geometry.area >= min_area
+
+    if geom_type == 'LineString':
+        return geometry.length >= min_shared_length
+
+    if hasattr(geometry, 'geoms'):
+        return any(
+            _supports_region_transition(part, min_area, min_shared_length)
+            for part in geometry.geoms
+        )
+
+    return False
+
+
 def compute_intersection(region1: ConvexRegion, region2: ConvexRegion) -> Optional[ConvexRegion]:
     """
     Compute intersection of two convex regions.
     
-    For touching regions (shared boundary), returns a "virtual" intersection
-    region representing the shared edge/point buffered slightly.
+    For adjacent regions that share a boundary segment, returns a thin
+    "virtual" intersection region around the shared edge.
     
     Args:
         region1, region2: ConvexRegion objects
         
     Returns:
-        New ConvexRegion representing intersection, or None if disjoint
+        New ConvexRegion representing intersection, or None if disjoint or
+        only touching at a single point
     """
     poly1 = region1.get_shapely_polygon()
     poly2 = region2.get_shapely_polygon()
     
     intersection = poly1.intersection(poly2)
     
-    if intersection.is_empty:
+    if not _supports_region_transition(intersection):
         return None
     
     # For proper area intersection
@@ -193,20 +227,24 @@ def compute_intersection(region1: ConvexRegion, region2: ConvexRegion) -> Option
         b = np.hstack([region1.b, region2.b])
         return ConvexRegion(vertices=vertices, A=A, b=b)
     
-    # For touching regions (LineString or Point intersection),
-    # create a small buffer around the shared boundary
-    if intersection.geom_type in ['LineString', 'MultiLineString', 'Point', 'MultiPoint', 'GeometryCollection']:
+    # For shared edges, create a thin interface region around the boundary.
+    if intersection.geom_type in ['LineString', 'MultiLineString', 'GeometryCollection']:
         # Buffer the intersection slightly to create a valid region
-        buffered = intersection.buffer(0.01, cap_style='square')
+        buffer_eps = 0.01
+        buffered = intersection.buffer(buffer_eps, cap_style='square')
         
-        # Clip to both original regions
-        clipped = buffered.intersection(poly1).intersection(poly2.buffer(0.01))
+        # Clip to small neighborhoods of both regions so the interface stays
+        # localized near the shared boundary segment.
+        clipped = (
+            buffered
+            .intersection(poly1.buffer(buffer_eps))
+            .intersection(poly2.buffer(buffer_eps))
+        )
         
         if clipped.is_empty or clipped.area < 1e-10:
-            # Fall back: use centroid of intersection as point
+            # Fall back to a tiny square around the shared-edge centroid.
             centroid = intersection.centroid
-            # Create tiny square region around centroid
-            eps = 0.01
+            eps = buffer_eps
             vertices = np.array([
                 [centroid.x - eps, centroid.y - eps],
                 [centroid.x + eps, centroid.y - eps],
@@ -228,31 +266,33 @@ def compute_intersection(region1: ConvexRegion, region2: ConvexRegion) -> Option
 
 
 def regions_intersect(region1: ConvexRegion, region2: ConvexRegion, 
-                      min_area: float = 1e-6) -> bool:
+                      min_area: float = 1e-6,
+                      min_shared_length: float = 1e-6) -> bool:
     """
-    Check if two regions have non-trivial intersection OR touch.
+    Check if two regions overlap or share a boundary segment.
     
-    For motion planning, regions that share a boundary are considered
-    adjacent since the robot can transition between them at the shared edge.
+    Regions that only touch at a single point are NOT considered adjacent.
     
     Args:
         region1, region2: Regions to check
-        min_area: Minimum intersection area to consider non-empty
+        min_area: Minimum overlap area to consider non-empty
+        min_shared_length: Minimum shared boundary length to consider adjacent
         
     Returns:
-        True if intersection has area >= min_area OR regions touch
+        True if regions have area overlap or share a boundary segment
     """
     poly1 = region1.get_shapely_polygon()
     poly2 = region2.get_shapely_polygon()
     
-    # Check if they touch (share boundary) or properly intersect
-    if poly1.touches(poly2) or poly1.intersects(poly2):
-        intersection = poly1.intersection(poly2)
-        # Accept if they touch (boundary intersection) or have area overlap
-        if not intersection.is_empty:
-            return True
-    
-    return False
+    if not poly1.intersects(poly2):
+        return False
+
+    intersection = poly1.intersection(poly2)
+    return _supports_region_transition(
+        intersection,
+        min_area=min_area,
+        min_shared_length=min_shared_length,
+    )
 
 
 def get_intersection_halfspaces(region1: ConvexRegion, region2: ConvexRegion) -> Tuple[np.ndarray, np.ndarray]:
