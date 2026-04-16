@@ -41,7 +41,7 @@ from visualization import create_animation, create_result_figure, save_result_su
 
 # Keep the random-maze pipeline aligned with scenario_builder.py.
 SCENARIO_BUILDER_ACD_TAU = 0.0
-SCENARIO_BUILDER_REGION_BUFFER = 1e-3
+SCENARIO_BUILDER_REGION_BUFFER = 1e-4
 
 
 @dataclass
