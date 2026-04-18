@@ -20,6 +20,16 @@ from dynamics import (DynamicsModel, UnicycleModel, ControlParameterization,
 from convex_regions import ConvexRegion
 
 
+def _get_config_value(config: Dict, key_path: Tuple[str, ...], default):
+    """Read a nested config value while staying backward compatible."""
+    current = config
+    for key in key_path:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
 @dataclass
 class ShootingBlockConfig:
     """Configuration for a multiple shooting block."""
@@ -171,13 +181,15 @@ class ShootingBlock:
         """
         Compute local cost J_v using trapezoidal quadrature.
         
-        J_v = a * Delta_v + integral[w_L * ||q_dot||^2 + w_E * ||u||^2] dtau
+        J_v = a * Delta_v
+            + integral[w_L * ||q_dot||^2 + w_E * ||u||^2] dtau
+            + w_u_smooth * sum_k ||u_{k+1} - u_k||^2
         
         Args:
             s_minus: Entry state
             w: Control parameters
             delta: Time duration
-            cost_weights: Dict with 'a', 'w_L', 'w_E'
+            cost_weights: Dict with 'a', 'w_L', 'w_E', 'w_u_smooth'
             
         Returns:
             Local cost value
@@ -185,6 +197,7 @@ class ShootingBlock:
         a = cost_weights.get('a', 1.0)
         w_L = cost_weights.get('w_L', 1.0)
         w_E = cost_weights.get('w_E', 1.0)
+        w_u_smooth = cost_weights.get('w_u_smooth', 0.0)
         
         # Time cost
         time_cost = a * delta
@@ -192,39 +205,35 @@ class ShootingBlock:
         # Get trajectory
         traj, tau_vals = self.integrator.integrate_with_trajectory(s_minus, w, delta)
         
-        # Compute running cost via trapezoidal rule
+        # Compute running cost via trapezoidal rule on the physical running
+        # integrand. Using position chords would systematically underestimate
+        # curved motion and make loops artificially cheap.
         running_cost = 0.0
         n_pts = len(traj)
-        
+
         for i in range(n_pts - 1):
             tau0 = tau_vals[i]
             tau1 = tau_vals[i + 1]
             dt = tau1 - tau0
-            
-            # Approximate velocity as finite difference (in physical time)
-            pos0 = self.dynamics.project_to_position(traj[i])
-            pos1 = self.dynamics.project_to_position(traj[i + 1])
-            
-            # Physical time velocity: dq/dt = (1/Delta) * dq/dtau
-            dq_dtau = (pos1 - pos0) / (dt + 1e-12)
-            q_dot = dq_dtau / (delta + 1e-12)  # Physical velocity
-            
-            # Control at midpoint
-            tau_mid = 0.5 * (tau0 + tau1)
-            u = self.control_param.evaluate(tau_mid, w)
-            
-            # Running cost integrand
-            # Note: the integral is integral[Delta * (w_L / Delta^2 * ||dq/dtau||^2
-            #     + w_E * ||u||^2)] dtau
-            #     = integral[(w_L / Delta) * ||dq/dtau||^2 + Delta * w_E * ||u||^2] dtau
-            velocity_cost = w_L * np.dot(q_dot, q_dot)
-            control_cost = w_E * np.dot(u, u)
-            
-            # Trapezoidal contribution (multiply by delta for time transformation)
-            integrand = velocity_cost + control_cost
-            running_cost += delta * dt * integrand
+
+            u0 = self.control_param.evaluate(tau0, w)
+            u1 = self.control_param.evaluate(tau1, w)
+            q_dot0 = self.dynamics.position_velocity(traj[i], u0)
+            q_dot1 = self.dynamics.position_velocity(traj[i + 1], u1)
+
+            running0 = w_L * np.dot(q_dot0, q_dot0) + w_E * np.dot(u0, u0)
+            running1 = w_L * np.dot(q_dot1, q_dot1) + w_E * np.dot(u1, u1)
+            running_cost += delta * dt * 0.5 * (running0 + running1)
+
+        smoothness_cost = 0.0
+        if self.control_param.n_segments > 1 and w_u_smooth > 0.0:
+            for seg in range(self.control_param.n_segments - 1):
+                u_left = self.control_param.get_segment_control(w, seg)
+                u_right = self.control_param.get_segment_control(w, seg + 1)
+                diff = u_right - u_left
+                smoothness_cost += w_u_smooth * np.dot(diff, diff)
         
-        return time_cost + running_cost
+        return time_cost + running_cost + smoothness_cost
 
 
 class ShootingBlockManager:
@@ -248,7 +257,38 @@ class ShootingBlockManager:
         """
         self.regions = regions
         self.dynamics = dynamics
-        self.config = config
+        self.raw_config = config
+        self.config = {
+            'n_integration_steps': _get_config_value(
+                config, ('shooting', 'n_integration_steps'),
+                config.get('n_integration_steps', 20)
+            ),
+            'n_mesh_points': _get_config_value(
+                config, ('shooting', 'n_mesh_points'),
+                config.get('n_mesh_points', 10)
+            ),
+            'n_control_segments': _get_config_value(
+                config, ('control', 'n_segments'),
+                config.get('n_segments', 2)
+            ),
+            'safety_margin': _get_config_value(
+                config, ('shooting', 'safety_margin'),
+                config.get('safety_margin', 0.02)
+            ),
+            'delta_min': _get_config_value(
+                config, ('dynamics', 'delta_min'),
+                config.get('delta_min', 0.1)
+            ),
+            'delta_max': _get_config_value(
+                config, ('dynamics', 'delta_max'),
+                config.get('delta_max', 10.0)
+            ),
+            'enforce_control_continuity': _get_config_value(
+                config, ('optimizer', 'enforce_control_continuity'),
+                config.get('enforce_control_continuity', True)
+            ),
+        }
+        self.enforce_control_continuity = bool(self.config['enforce_control_continuity'])
         
         # Create shooting blocks
         self.blocks: Dict[int, ShootingBlock] = {}
@@ -256,12 +296,12 @@ class ShootingBlockManager:
         for region in regions:
             block_config = ShootingBlockConfig(
                 region_index=region.index,
-                n_integration_steps=config.get('n_integration_steps', 20),
-                n_mesh_points=config.get('n_mesh_points', 10),
-                n_control_segments=config.get('n_segments', 2),
-                safety_margin=config.get('safety_margin', 0.02),
-                delta_min=config.get('delta_min', 0.1),
-                delta_max=config.get('delta_max', 10.0)
+                n_integration_steps=self.config['n_integration_steps'],
+                n_mesh_points=self.config['n_mesh_points'],
+                n_control_segments=self.config['n_control_segments'],
+                safety_margin=self.config['safety_margin'],
+                delta_min=self.config['delta_min'],
+                delta_max=self.config['delta_max']
             )
             
             self.blocks[region.index] = ShootingBlock(
@@ -315,8 +355,11 @@ class ShootingBlockManager:
             'mesh_states': [],
             'defects': [],
             'safety_violations': [],
+            'interface_errors': [],
+            'control_jumps': [],
             'local_costs': [],
             'total_cost': 0.0,
+            'max_control_jump': 0.0,
             'is_feasible': True
         }
         
@@ -361,8 +404,21 @@ class ShootingBlockManager:
             s_minus_next = variables[next_idx]['s_minus']
             
             interface_error = np.linalg.norm(s_plus_curr - s_minus_next)
+            result['interface_errors'].append(interface_error)
             if interface_error > 1e-4:
                 result['is_feasible'] = False
+
+            control_param = self.blocks[curr_idx].control_param
+            u_exit = control_param.evaluate(1.0, variables[curr_idx]['w'])
+            u_entry = control_param.evaluate(0.0, variables[next_idx]['w'])
+            control_jump = float(np.linalg.norm(u_exit - u_entry))
+            result['control_jumps'].append(control_jump)
+
+            if self.enforce_control_continuity and control_jump > 1e-4:
+                result['is_feasible'] = False
+
+        if result['control_jumps']:
+            result['max_control_jump'] = max(result['control_jumps'])
         
         # Check boundary conditions
         first_idx = path_regions[0]
@@ -383,11 +439,12 @@ def create_casadi_local_cost(dynamics: DynamicsModel,
     """
     Create CasADi function for local cost computation.
     
-    J_v = a * Delta + integral[Delta * (w_L / Delta^2 * ||dq/dtau||^2 + w_E * ||u||^2)] dtau
-        = a * Delta + sum_i Delta * dt * [(w_L / Delta) * ||dq/dtau||^2 + w_E * ||u||^2]
+    J_v = a * Delta
+        + integral[Delta * (w_L / Delta^2 * ||dq/dtau||^2 + w_E * ||u||^2)] dtau
+        + w_u_smooth * sum_k ||u_{k+1} - u_k||^2
         
     Returns:
-        Function(s_minus, w, delta, a, w_L, w_E) -> cost
+        Function(s_minus, w, delta, a, w_L, w_E, w_u_smooth) -> cost
     """
     # Symbolic variables
     s_minus = ca.MX.sym('s_minus', dynamics.n_x)
@@ -396,6 +453,7 @@ def create_casadi_local_cost(dynamics: DynamicsModel,
     a = ca.MX.sym('a', 1)
     w_L = ca.MX.sym('w_L', 1)
     w_E = ca.MX.sym('w_E', 1)
+    w_u_smooth = ca.MX.sym('w_u_smooth', 1)
     
     dt = 1.0 / n_steps
     
@@ -407,16 +465,12 @@ def create_casadi_local_cost(dynamics: DynamicsModel,
     
     for i in range(n_steps):
         tau = i * dt
-        tau_mid = tau + 0.5 * dt
         tau_end = tau + dt
         
         # Get control
         u_start = control_param.evaluate_casadi(tau, w)
-        u_mid = control_param.evaluate_casadi(tau_mid, w)
         u_end = control_param.evaluate_casadi(tau_end, w)
-        
-        # Current position
-        pos_start = dynamics.project_to_position_casadi(x)
+        u_mid = control_param.evaluate_casadi(tau + 0.5 * dt, w)
         
         # RK4 step
         k1 = delta * dynamics.f_casadi(x, u_start)
@@ -425,29 +479,26 @@ def create_casadi_local_cost(dynamics: DynamicsModel,
         k4 = delta * dynamics.f_casadi(x + dt * k3, u_end)
         
         x_next = x + (dt / 6) * (k1 + 2*k2 + 2*k3 + k4)
-        
-        # Position after step
-        pos_end = dynamics.project_to_position_casadi(x_next)
-        
-        # Velocity (physical time)
-        dq_dtau = (pos_end - pos_start) / dt
-        # Note: actual velocity is dq/dt = (1 / Delta) * dq/dtau
-        # ||dq/dt||^2 = (1 / Delta^2) * ||dq/dtau||^2
-        
-        # Control cost
-        u = u_mid
-        
-        # Running cost: Delta * dt * [(w_L / Delta) * ||dq/dtau||^2 / Delta + w_E * ||u||^2]
-        #             = dt * [(w_L / Delta) * ||dq/dtau||^2 + Delta * w_E * ||u||^2]
-        velocity_sq = ca.dot(dq_dtau, dq_dtau)
-        control_sq = ca.dot(u, u)
-        
-        running = w_L * velocity_sq / (delta + 1e-6) + delta * w_E * control_sq
-        cost = cost + dt * running
+
+        q_dot_start = dynamics.position_velocity_casadi(x, u_start)
+        q_dot_end = dynamics.position_velocity_casadi(x_next, u_end)
+        running_start = w_L * ca.dot(q_dot_start, q_dot_start) + w_E * ca.dot(u_start, u_start)
+        running_end = w_L * ca.dot(q_dot_end, q_dot_end) + w_E * ca.dot(u_end, u_end)
+
+        cost = cost + delta * dt * 0.5 * (running_start + running_end)
         
         x = x_next
+
+    if control_param.n_segments > 1:
+        for seg in range(control_param.n_segments - 1):
+            start_left = seg * control_param.n_u
+            start_right = (seg + 1) * control_param.n_u
+            u_left = w[start_left:start_left + control_param.n_u]
+            u_right = w[start_right:start_right + control_param.n_u]
+            diff = u_right - u_left
+            cost = cost + w_u_smooth * ca.dot(diff, diff)
     
-    F = ca.Function('local_cost', [s_minus, w, delta, a, w_L, w_E], [cost],
-                   ['s_minus', 'w', 'delta', 'a', 'w_L', 'w_E'], ['cost'])
+    F = ca.Function('local_cost', [s_minus, w, delta, a, w_L, w_E, w_u_smooth], [cost],
+                   ['s_minus', 'w', 'delta', 'a', 'w_L', 'w_E', 'w_u_smooth'], ['cost'])
     
     return F

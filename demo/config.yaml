@@ -47,7 +47,7 @@ dynamics:
   omega_max: 3.14159   # maximum angular velocity (pi)
   
   # Time bounds per region
-  delta_min: 0.1   # minimum time in each region
+  delta_min: 0.01  # minimum time in each region
   delta_max: 10.0  # maximum time in each region
 
 # -----------------------------------------------------------------------------
@@ -79,7 +79,9 @@ shooting:
 # Cost Function Weights
 # -----------------------------------------------------------------------------
 # Total cost: sum_v rho_v where
-# rho_v >= J_v = a * Delta_v + integral[w_L * ||q_dot||^2 + w_E * ||u||^2] dtau
+# rho_v >= J_v = a * Delta_v
+#            + integral[w_L * ||q_dot||^2 + w_E * ||u||^2] dtau
+#            + w_u_smooth * sum_k ||u_{k+1} - u_k||^2
 cost:
   # Time penalty weight (penalizes total trajectory duration)
   a: 1.0
@@ -90,12 +92,21 @@ cost:
   # Control effort penalty weight
   w_E: 1.0
 
+  # Penalize abrupt control changes between neighboring control segments.
+  # Larger values make turns and accelerations smoother, but can increase time.
+  w_u_smooth: 0.2
 # -----------------------------------------------------------------------------
 # Optimizer Configuration
 # -----------------------------------------------------------------------------
 optimizer:
   # Safety limit for graph-path counting in experiment summaries
   max_paths: 1500
+
+  # Enforce u_left(1) = u_right(0) across active region transitions.
+  # This makes the final control profile continuous across interfaces, but
+  # does not by itself eliminate the need for path polish when the integrated
+  # discrete relaxation remains fractional.
+  enforce_control_continuity: true
   
   # Solver verbosity/options for the integrated continuous relaxation solve
   ipopt:
@@ -163,7 +174,19 @@ scenarios:
     problem_preset: "maze"
     overrides:
       shooting:
-        n_mesh_points: 4
+        # The maze decomposition often creates narrow passages and sliver
+        # interface regions. Three mesh points only checks one interior sample
+        # per region, which is too sparse for curved unicycle trajectories.
+        n_mesh_points: 5
+      control:
+        # Two piecewise-constant segments per region are often too coarse for
+        # the maze ACD decomposition, especially around tiny bridge regions.
+        n_segments: 4
+      optimizer:
+        # Exact control continuity across every region interface makes the
+        # unicycle start turning too early and keep turning too long when the
+        # graph contains narrow/sliver transitions.
+        enforce_control_continuity: false
 
 # -----------------------------------------------------------------------------
 # Output Configuration

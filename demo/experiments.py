@@ -52,6 +52,7 @@ class ExperimentResult:
                 f"  Total Duration: {sum(self.optimization_result.time_durations.values()):.3f} s",
                 f"  Defect Norm: {self.optimization_result.defect_norm:.2e}",
                 f"  Max Connection Gap: {self.optimization_result.max_connection_gap:.2e}",
+                f"  Max Control Jump: {self.optimization_result.max_control_jump:.2e}",
             ])
             if self.optimization_result.max_integrality_gap > 0.0:
                 lines.append(

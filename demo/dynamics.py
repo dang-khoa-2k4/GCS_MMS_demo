@@ -72,6 +72,20 @@ class DynamicsModel(ABC):
         """CasADi symbolic version of projection."""
         pass
 
+    @abstractmethod
+    def position_velocity(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
+        """
+        Physical position derivative dq/dt for the current state/control.
+
+        This is used by objective terms that penalize translational motion.
+        """
+        pass
+
+    @abstractmethod
+    def position_velocity_casadi(self, x: ca.MX, u: ca.MX) -> ca.MX:
+        """CasADi symbolic version of the physical position derivative."""
+        pass
+
 
 @dataclass
 class UnicycleModel(DynamicsModel):
@@ -150,6 +164,24 @@ class UnicycleModel(DynamicsModel):
     def project_to_position_casadi(self, x: ca.MX) -> ca.MX:
         """CasADi symbolic position extraction."""
         return x[:2]
+
+    def position_velocity(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
+        """Physical translational velocity [dx/dt, dy/dt]."""
+        theta = x[2]
+        v = u[0]
+        return np.array([
+            v * np.cos(theta),
+            v * np.sin(theta),
+        ])
+
+    def position_velocity_casadi(self, x: ca.MX, u: ca.MX) -> ca.MX:
+        """CasADi symbolic translational velocity."""
+        theta = x[2]
+        v = u[0]
+        return ca.vertcat(
+            v * ca.cos(theta),
+            v * ca.sin(theta),
+        )
     
     def get_control_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -201,6 +233,14 @@ class ControlParameterization:
             weights[seg] = weight_start * weight_end
 
         return weights
+
+    @staticmethod
+    def _normalize_weights_numpy(weights: np.ndarray) -> np.ndarray:
+        """Normalize soft segment weights so control amplitude stays consistent."""
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 1e-12:
+            return weights
+        return weights / weight_sum
     
     def evaluate(self, tau: float, w: np.ndarray) -> np.ndarray:
         """
@@ -218,7 +258,9 @@ class ControlParameterization:
         
         elif self.parameterization == "piecewise_constant":
             result = np.zeros(self.n_u, dtype=np.float64)
-            weights = self._smooth_segment_weights_numpy(float(tau))
+            weights = self._normalize_weights_numpy(
+                self._smooth_segment_weights_numpy(float(tau))
+            )
 
             for seg, weight in enumerate(weights):
                 start_idx = seg * self.n_u
@@ -245,6 +287,7 @@ class ControlParameterization:
             # This is an approximation for optimization purposes
             result = ca.MX.zeros(self.n_u)
             sharpness = self.soft_switch_sharpness
+            weight_sum = 0
             
             for seg in range(self.n_segments):
                 # Segment boundaries
@@ -261,9 +304,9 @@ class ControlParameterization:
                 u_seg = w[start_idx:start_idx + self.n_u]
                 
                 result = result + weight * u_seg
+                weight_sum = weight_sum + weight
             
-            # Normalize weights (approximate)
-            return result
+            return result / (weight_sum + 1e-12)
         
         else:
             raise ValueError(f"Unknown parameterization: {self.parameterization}")

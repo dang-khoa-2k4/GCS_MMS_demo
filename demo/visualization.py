@@ -366,6 +366,7 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
         f"Paths   {result.n_paths_evaluated}",
         f"Defect  {result.defect_norm:.2e}",
         f"Gap     {result.max_connection_gap:.2e}",
+        f"CtrlGap {result.max_control_jump:.2e}",
         f"Viol    {result.constraint_violation:.2e}",
     ]
 

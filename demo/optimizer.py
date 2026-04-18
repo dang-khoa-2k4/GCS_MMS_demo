@@ -34,6 +34,7 @@ class OptimizationConfig:
     a: float = 1.0       # Time penalty
     w_L: float = 1.0     # Velocity/path length penalty
     w_E: float = 1.0     # Control effort penalty
+    w_u_smooth: float = 0.2  # Penalty on control changes across segments
     
     # Shooting parameters
     n_integration_steps: int = 20
@@ -56,6 +57,7 @@ class OptimizationConfig:
     M_position: float = 20.0
     M_interface: float = 20.0
     M_time: float = 100.0
+    enforce_control_continuity: bool = True
     
     # IPOPT options
     max_iter: int = 3000
@@ -91,6 +93,7 @@ class OptimizationResult:
     defect_norm: float = 0.0
     constraint_violation: float = 0.0
     max_connection_gap: float = 0.0
+    max_control_jump: float = 0.0
     max_integrality_gap: float = 0.0
 
 
@@ -120,6 +123,25 @@ def _compute_connection_gap(path_regions: List[int],
         )
 
     return float(max(gaps)) if gaps else 0.0
+
+
+def _compute_control_jump(path_regions: List[int],
+                          control_params: Dict[int, np.ndarray],
+                          control_param: ControlParameterization) -> float:
+    """Maximum control mismatch across consecutive active regions."""
+    if len(path_regions) <= 1:
+        return 0.0
+
+    jumps = []
+    for left_region, right_region in zip(path_regions[:-1], path_regions[1:]):
+        if left_region not in control_params or right_region not in control_params:
+            continue
+
+        u_exit = control_param.evaluate(1.0, control_params[left_region])
+        u_entry = control_param.evaluate(0.0, control_params[right_region])
+        jumps.append(np.linalg.norm(u_exit - u_entry))
+
+    return float(max(jumps)) if jumps else 0.0
 
 
 def _compute_bound_violation(g_val: np.ndarray,
@@ -492,6 +514,15 @@ class PathNLPSolver:
             # 3. coupling s_u^+ = s_v^-
             # This works for both overlapping regions and regions that only
             # touch on a shared boundary.
+
+            if self.config.enforce_control_continuity:
+                u_exit_curr = self.control_param.evaluate_casadi(1.0, w_list[i])
+                u_entry_next = self.control_param.evaluate_casadi(0.0, w_list[i + 1])
+                control_coupling = u_exit_curr - u_entry_next
+
+                g.append(control_coupling)
+                lbg.extend([0.0] * self.dynamics.n_u)
+                ubg.extend([0.0] * self.dynamics.n_u)
         
         # -----------------------------------------------------------------
         # Boundary conditions
@@ -522,11 +553,12 @@ class PathNLPSolver:
         a = self.config.a
         w_L = self.config.w_L
         w_E = self.config.w_E
+        w_u_smooth = self.config.w_u_smooth
         
         for i in range(n_regions):
             local_cost = self.local_cost_fn(
                 s_minus_list[i], w_list[i], delta_list[i],
-                a, w_L, w_E
+                a, w_L, w_E, w_u_smooth
             )
             cost = cost + local_cost
         
@@ -666,7 +698,12 @@ class PathNLPSolver:
             start_state,
             goal_state
         )
-        
+        result.max_control_jump = _compute_control_jump(
+            path_regions,
+            result.control_params,
+            self.control_param
+        )
+
         return result
 
 class IntegratedMIOCPSolver:
@@ -734,12 +771,25 @@ class IntegratedMIOCPSolver:
         for _ in range(config.n_control_segments):
             control_abs.extend([max_v, max_omega])
         self.control_big_m = np.array(control_abs, dtype=np.float64)
+        self.control_value_big_m = np.array([2.0 * max_v, 2.0 * max_omega], dtype=np.float64)
         
         running_cost_upper = (
             config.w_L * (max_v ** 2) +
             config.w_E * ((max_v ** 2) + (max_omega ** 2))
         )
-        self.rho_big_m = 2.0 * config.delta_max * (config.a + running_cost_upper) + 1.0
+        smoothness_upper = 0.0
+        if config.n_control_segments > 1:
+            max_control_jump_sq = (2.0 * max_v) ** 2 + (2.0 * max_omega) ** 2
+            smoothness_upper = (
+                config.w_u_smooth *
+                (config.n_control_segments - 1) *
+                max_control_jump_sq
+            )
+        self.rho_big_m = (
+            2.0 * config.delta_max * (config.a + running_cost_upper) +
+            smoothness_upper +
+            1.0
+        )
     
     @staticmethod
     def _symbol_node_id(node_id: str) -> str:
@@ -1241,7 +1291,7 @@ class IntegratedMIOCPSolver:
             
             local_cost = self.local_cost_fn(
                 s_minus, w, delta,
-                self.config.a, self.config.w_L, self.config.w_E
+                self.config.a, self.config.w_L, self.config.w_E, self.config.w_u_smooth
             )
             add_leq(local_cost - rho)
         
@@ -1297,6 +1347,13 @@ class IntegratedMIOCPSolver:
             add_leq(-diff_upstream - self.config.M_interface * (1 - y))
             add_leq(diff_downstream - self.config.M_interface * (1 - y))
             add_leq(-diff_downstream - self.config.M_interface * (1 - y))
+
+            if self.config.enforce_control_continuity:
+                u_exit = self.control_param.evaluate_casadi(1.0, w_vars[u])
+                u_entry = self.control_param.evaluate_casadi(0.0, w_vars[v])
+                control_diff = u_exit - u_entry
+                add_leq(control_diff - self.control_value_big_m * (1 - y))
+                add_leq(-control_diff - self.control_value_big_m * (1 - y))
         
         # Source and target boundary coupling.
         for edge in self.graph.source_edges:
@@ -1441,6 +1498,11 @@ class IntegratedMIOCPSolver:
             start_state,
             goal_state
         )
+        result.max_control_jump = _compute_control_jump(
+            path_regions,
+            result.control_params,
+            self.control_param
+        )
         
         if result.success and (
             result.max_integrality_gap > 1e-3 or result.max_connection_gap > 1e-4
@@ -1465,6 +1527,7 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         a=cost_config.get('a', 1.0),
         w_L=cost_config.get('w_L', 1.0),
         w_E=cost_config.get('w_E', 1.0),
+        w_u_smooth=cost_config.get('w_u_smooth', 0.2),
         n_integration_steps=shooting_config.get('n_integration_steps', 20),
         n_mesh_points=shooting_config.get('n_mesh_points', 3),
         n_control_segments=control_config.get('n_segments', 2),
@@ -1479,6 +1542,7 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         M_position=optimizer_config.get('big_M', {}).get('position', 20.0),
         M_interface=optimizer_config.get('big_M', {}).get('interface', 20.0),
         M_time=optimizer_config.get('big_M', {}).get('time', 100.0),
+        enforce_control_continuity=optimizer_config.get('enforce_control_continuity', True),
         max_iter=optimizer_config.get('ipopt', {}).get('max_iter', 3500),
         tol=optimizer_config.get('ipopt', {}).get('tol', 1e-6),
         print_level=optimizer_config.get('ipopt', {}).get('print_level', 0),
